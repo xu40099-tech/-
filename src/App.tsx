@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { PointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import {
   Circle,
@@ -218,9 +218,6 @@ function App() {
   const [autoZoomEnabled, setAutoZoomEnabled] = useState(true);
   const [zoomScale, setZoomScale] = useState(1.8);
   const [zoomDuration, setZoomDuration] = useState(1_400);
-  const [isDrawingRegion, setIsDrawingRegion] = useState(false);
-  const [regionDraft, setRegionDraft] = useState<Region>();
-  const [regionStart, setRegionStart] = useState<{ x: number; y: number }>();
 
   const startedAtRef = useRef(0);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -245,6 +242,17 @@ function App() {
     safeInvoke<{ path: string }>("get_recordings_dir").then((result) => {
       if (result?.path) setRecordingsDir(result.path);
     });
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<Region>("region-selected", ({ payload }) => {
+      updateRecordingConfig({ sourceId: "custom-region", sourceType: "region", region: payload });
+      setSources((current) => current.map((source) =>
+        source.kind === "region" ? { ...source, width: payload.width, height: payload.height } : source,
+      ));
+      setStatus(`Region selected: ${payload.width}x${payload.height} at ${payload.x}, ${payload.y}.`);
+    });
+    return () => { void unlisten.then((dispose) => dispose()); };
   }, []);
 
   useEffect(() => {
@@ -284,11 +292,6 @@ function App() {
         event.preventDefault();
         void stopRecording();
       }
-      if (event.key === "Escape" && isDrawingRegion) {
-        setIsDrawingRegion(false);
-        setRegionDraft(undefined);
-        setRegionStart(undefined);
-      }
     };
 
     window.addEventListener("keydown", onKeyDown);
@@ -317,7 +320,7 @@ function App() {
 
     if (recordingConfig.sourceType === "region" && !recordingConfig.region) {
       setStatus("Draw a recording region first.");
-      setIsDrawingRegion(true);
+      void beginRegionDraw();
       return;
     }
 
@@ -486,61 +489,13 @@ function App() {
     return selected;
   }
 
-  function beginRegionDraw() {
-    setIsDrawingRegion(true);
-    setRegionDraft(undefined);
-    setRegionStart(undefined);
-    setStatus("Drag a rectangle to choose the recording region. Press Esc to cancel.");
-  }
-
-  function onRegionPointerDown(event: PointerEvent<HTMLDivElement>) {
-    const point = { x: Math.round(event.screenX), y: Math.round(event.screenY) };
-    setRegionStart(point);
-    setRegionDraft({ ...point, width: 1, height: 1 });
-    event.currentTarget.setPointerCapture(event.pointerId);
-  }
-
-  function onRegionPointerMove(event: PointerEvent<HTMLDivElement>) {
-    if (!regionStart) return;
-    const x = Math.round(event.screenX);
-    const y = Math.round(event.screenY);
-    setRegionDraft({
-      x: Math.min(regionStart.x, x),
-      y: Math.min(regionStart.y, y),
-      width: Math.abs(x - regionStart.x),
-      height: Math.abs(y - regionStart.y),
-    });
-  }
-
-  function onRegionPointerUp(event: PointerEvent<HTMLDivElement>) {
-    if (!regionStart) return;
-    const endX = Math.round(event.screenX);
-    const endY = Math.round(event.screenY);
-    const finalDraft = {
-      x: Math.min(regionStart.x, endX),
-      y: Math.min(regionStart.y, endY),
-      width: Math.abs(endX - regionStart.x),
-      height: Math.abs(endY - regionStart.y),
-    };
-    const nextRegion = {
-      ...finalDraft,
-      width: Math.max(160, finalDraft.width),
-      height: Math.max(120, finalDraft.height),
-    };
-    updateRecordingConfig({
-      sourceId: "custom-region",
-      sourceType: "region",
-      region: nextRegion,
-    });
-    setSources((current) =>
-      current.map((source) =>
-        source.kind === "region" ? { ...source, width: nextRegion.width, height: nextRegion.height } : source,
-      ),
-    );
-    setIsDrawingRegion(false);
-    setRegionDraft(undefined);
-    setRegionStart(undefined);
-    setStatus(`Region selected: ${nextRegion.width}x${nextRegion.height} at ${nextRegion.x}, ${nextRegion.y}.`);
+  async function beginRegionDraw() {
+    setStatus("Opening full-screen region selector...");
+    try {
+      await invoke("open_region_selector");
+    } catch (error) {
+      setStatus(`Cannot open region selector: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   function updateCrop(patch: Partial<CropRect>) {
@@ -641,28 +596,6 @@ function App() {
         </div>
         <div className={`record-status ${recordingState}`}>{status}</div>
       </header>
-
-      {isDrawingRegion && (
-        <div
-          className="region-drawer"
-          onPointerDown={onRegionPointerDown}
-          onPointerMove={onRegionPointerMove}
-          onPointerUp={onRegionPointerUp}
-        >
-          <div className="region-help">Drag to draw recording area. Esc cancels.</div>
-          {regionDraft && (
-            <div
-              className="region-box"
-              style={{
-                left: `${Math.min(window.innerWidth - 1, Math.max(0, regionDraft.x - window.screenX))}px`,
-                top: `${Math.min(window.innerHeight - 1, Math.max(0, regionDraft.y - window.screenY))}px`,
-                width: `${regionDraft.width}px`,
-                height: `${regionDraft.height}px`,
-              }}
-            />
-          )}
-        </div>
-      )}
 
       <section className="record-layout">
         <aside className="record-controls">

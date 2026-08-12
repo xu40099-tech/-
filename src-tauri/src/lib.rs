@@ -10,7 +10,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::Manager;
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -35,6 +35,15 @@ struct CaptureSource {
     display_id: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
+}
+
+#[derive(Clone, Serialize)]
+struct RegionSelectorConfig {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    scale_factor: f64,
 }
 
 #[derive(Serialize)]
@@ -122,7 +131,7 @@ struct DirectExportInput {
     fps: Option<u32>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Region {
     x: i32,
     y: i32,
@@ -496,6 +505,73 @@ fn get_recordings_dir() -> Result<SaveResult, String> {
     Ok(SaveResult {
         path: recordings_dir()?.to_string_lossy().to_string(),
     })
+}
+
+#[tauri::command]
+fn open_region_selector(app: tauri::AppHandle) -> Result<RegionSelectorConfig, String> {
+    if let Some(existing) = app.get_webview_window("region-selector") {
+        existing.close().map_err(|error| error.to_string())?;
+    }
+
+    let main = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Main window was not found.".to_string())?;
+    let monitor = main
+        .current_monitor()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Could not determine the monitor containing the main window.".to_string())?;
+    let position = *monitor.position();
+    let size = *monitor.size();
+    let config = RegionSelectorConfig {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+        scale_factor: monitor.scale_factor(),
+    };
+    let query = format!(
+        "index.html?region-selector=1&x={}&y={}&scale={}",
+        config.x, config.y, config.scale_factor
+    );
+    let logical_x = config.x as f64 / config.scale_factor;
+    let logical_y = config.y as f64 / config.scale_factor;
+    let logical_width = config.width as f64 / config.scale_factor;
+    let logical_height = config.height as f64 / config.scale_factor;
+
+    WebviewWindowBuilder::new(&app, "region-selector", WebviewUrl::App(query.into()))
+        .title("Choose recording region")
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .position(logical_x, logical_y)
+        .inner_size(logical_width, logical_height)
+        .build()
+        .map_err(|error| error.to_string())?;
+
+    Ok(config)
+}
+
+#[tauri::command]
+fn complete_region_selection(
+    app: tauri::AppHandle,
+    region: Region,
+) -> Result<(), String> {
+    app.emit_to("main", "region-selected", region)
+        .map_err(|error| error.to_string())?;
+    if let Some(selector) = app.get_webview_window("region-selector") {
+        selector.close().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_region_selection(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(selector) = app.get_webview_window("region-selector") {
+        selector.close().map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1313,6 +1389,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_capture_sources,
             get_recordings_dir,
+            open_region_selector,
+            complete_region_selection,
+            cancel_region_selection,
             start_recording,
             pause_recording,
             resume_recording,

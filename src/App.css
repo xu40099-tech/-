@@ -396,35 +396,6 @@ button.selected {
   line-height: 1.45;
 }
 
-.region-drawer {
-  background: rgba(6, 17, 22, 0.44);
-  cursor: crosshair;
-  inset: 0;
-  position: fixed;
-  z-index: 50;
-}
-
-.region-help {
-  background: #ffffff;
-  border: 1px solid #d8e0e2;
-  border-radius: 8px;
-  color: #17272a;
-  font-size: 13px;
-  left: 50%;
-  padding: 10px 14px;
-  position: absolute;
-  top: 20px;
-  transform: translateX(-50%);
-}
-
-.region-box {
-  border: 2px solid #61e0c2;
-  box-shadow:
-    0 0 0 9999px rgba(6, 17, 22, 0.28),
-    0 0 24px rgba(97, 224, 194, 0.4);
-  position: absolute;
-}
-
 .custom-cursor,
 .click-ripple,
 .crop-preview {
