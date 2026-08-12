@@ -18,7 +18,7 @@ use std::os::windows::process::CommandExt;
 use windows_sys::Win32::Foundation::POINT;
 #[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON,
+    GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON, VK_RBUTTON,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
@@ -507,38 +507,53 @@ fn get_recordings_dir() -> Result<SaveResult, String> {
     })
 }
 
+fn current_main_monitor_config(app: &tauri::AppHandle) -> Result<RegionSelectorConfig, String> {
+    let main = app.get_webview_window("main").ok_or_else(|| "Main window was not found.".to_string())?;
+    let monitor = main.current_monitor().map_err(|error| error.to_string())?.ok_or_else(|| "Could not determine the monitor containing the main window.".to_string())?;
+    let position = *monitor.position();
+    let size = *monitor.size();
+    Ok(RegionSelectorConfig { x: position.x, y: position.y, width: size.width, height: size.height, scale_factor: monitor.scale_factor() })
+}
+
+#[tauri::command]
+fn get_region_selector_config(app: tauri::AppHandle) -> Result<RegionSelectorConfig, String> {
+    current_main_monitor_config(&app)
+}
+
+#[cfg(windows)]
+fn spawn_region_selector_escape_guard(app: tauri::AppHandle) {
+    thread::spawn(move || {
+        let mut was_pressed = false;
+        while app.get_webview_window("region-selector").is_some() {
+            let is_pressed = unsafe { GetAsyncKeyState(VK_ESCAPE as i32) } < 0;
+            if is_pressed && !was_pressed {
+                if let Some(selector) = app.get_webview_window("region-selector") {
+                    let _ = selector.close();
+                }
+                break;
+            }
+            was_pressed = is_pressed;
+            thread::sleep(Duration::from_millis(25));
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn spawn_region_selector_escape_guard(_app: tauri::AppHandle) {}
+
 #[tauri::command]
 fn open_region_selector(app: tauri::AppHandle) -> Result<RegionSelectorConfig, String> {
     if let Some(existing) = app.get_webview_window("region-selector") {
         existing.close().map_err(|error| error.to_string())?;
     }
 
-    let main = app
-        .get_webview_window("main")
-        .ok_or_else(|| "Main window was not found.".to_string())?;
-    let monitor = main
-        .current_monitor()
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "Could not determine the monitor containing the main window.".to_string())?;
-    let position = *monitor.position();
-    let size = *monitor.size();
-    let config = RegionSelectorConfig {
-        x: position.x,
-        y: position.y,
-        width: size.width,
-        height: size.height,
-        scale_factor: monitor.scale_factor(),
-    };
-    let query = format!(
-        "index.html?region-selector=1&x={}&y={}&scale={}",
-        config.x, config.y, config.scale_factor
-    );
+    let config = current_main_monitor_config(&app)?;
     let logical_x = config.x as f64 / config.scale_factor;
     let logical_y = config.y as f64 / config.scale_factor;
     let logical_width = config.width as f64 / config.scale_factor;
     let logical_height = config.height as f64 / config.scale_factor;
 
-    WebviewWindowBuilder::new(&app, "region-selector", WebviewUrl::App(query.into()))
+    WebviewWindowBuilder::new(&app, "region-selector", WebviewUrl::App("region-selector.html".into()))
         .title("Choose recording region")
         .decorations(false)
         .transparent(true)
@@ -549,6 +564,7 @@ fn open_region_selector(app: tauri::AppHandle) -> Result<RegionSelectorConfig, S
         .inner_size(logical_width, logical_height)
         .build()
         .map_err(|error| error.to_string())?;
+    spawn_region_selector_escape_guard(app.clone());
 
     Ok(config)
 }
@@ -1389,6 +1405,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_capture_sources,
             get_recordings_dir,
+            get_region_selector_config,
             open_region_selector,
             complete_region_selection,
             cancel_region_selection,
