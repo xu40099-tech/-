@@ -10,6 +10,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::Manager;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -238,21 +239,32 @@ fn project_store_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn ffmpeg_path() -> Option<PathBuf> {
+fn ffmpeg_path(app: &tauri::AppHandle) -> Option<PathBuf> {
     let executable = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
-    let current = app_root_dir().ok()?;
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(PathBuf::from));
 
-    let mut candidates = vec![
-        current.join("node_modules").join("ffmpeg-static").join(executable),
-        current
-            .join("..")
-            .join("node_modules")
-            .join("ffmpeg-static")
-            .join(executable),
-    ];
+    let mut candidates = Vec::new();
+
+    if let Some(dir) = &exe_dir {
+        candidates.push(dir.join(executable));
+    }
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join(executable));
+    }
+
+    if let Ok(current) = app_root_dir() {
+        candidates.push(current.join("node_modules").join("ffmpeg-static").join(executable));
+        candidates.push(
+            current
+                .join("..")
+                .join("node_modules")
+                .join("ffmpeg-static")
+                .join(executable),
+        );
+    }
 
     if let Some(dir) = exe_dir {
         candidates.push(dir.join("node_modules").join("ffmpeg-static").join(executable));
@@ -490,6 +502,7 @@ fn get_recordings_dir() -> Result<SaveResult, String> {
 fn start_recording(
     config: Value,
     state: tauri::State<RecorderState>,
+    app: tauri::AppHandle,
 ) -> Result<NativeRecordingStartResult, String> {
     let mut session = state.session.lock().map_err(|error| error.to_string())?;
     if session.is_some() {
@@ -505,10 +518,8 @@ fn start_recording(
         .get("region")
         .cloned()
         .and_then(|value| serde_json::from_value::<Region>(value).ok());
-    let ffmpeg = ffmpeg_path().ok_or_else(|| {
-        "FFmpeg was not found. Please confirm node_modules/ffmpeg-static/ffmpeg.exe exists."
-            .to_string()
-    })?;
+    let ffmpeg = ffmpeg_path(&app)
+        .ok_or_else(|| "FFmpeg missing from installation package".to_string())?;
     let output = recording_output_path("mp4")?;
 
     let mut command = Command::new(ffmpeg);
@@ -1040,6 +1051,7 @@ fn build_video_filter_graph(
 }
 
 fn run_export(
+    app: &tauri::AppHandle,
     asset_path: &str,
     format: &str,
     resolution: &str,
@@ -1058,10 +1070,8 @@ fn run_export(
         return Err(format!("Recording file was not found: {asset_path}"));
     }
 
-    let ffmpeg = ffmpeg_path().ok_or_else(|| {
-        "FFmpeg was not found. Run npm install or confirm node_modules/ffmpeg-static/ffmpeg.exe exists."
-            .to_string()
-    })?;
+    let ffmpeg = ffmpeg_path(app)
+        .ok_or_else(|| "FFmpeg missing from installation package".to_string())?;
 
     let extension = if format == "gif" { "gif" } else { "mp4" };
     let output = if let Some(destination) = destination_path {
@@ -1145,11 +1155,15 @@ fn run_export(
 }
 
 #[tauri::command]
-fn export_recording(input: DirectExportInput) -> Result<ExportResult, String> {
+fn export_recording(
+    input: DirectExportInput,
+    app: tauri::AppHandle,
+) -> Result<ExportResult, String> {
     let source_width = input.source_width.unwrap_or(1920.0);
     let source_height = input.source_height.unwrap_or(1080.0);
     let fps = input.fps.unwrap_or(60).clamp(15, 60);
     run_export(
+        &app,
         &input.source_path,
         &input.format,
         &input.resolution,
@@ -1166,7 +1180,11 @@ fn export_recording(input: DirectExportInput) -> Result<ExportResult, String> {
 }
 
 #[tauri::command]
-fn export_project(export_config: Value, project: Value) -> Result<ExportResult, String> {
+fn export_project(
+    export_config: Value,
+    project: Value,
+    app: tauri::AppHandle,
+) -> Result<ExportResult, String> {
     let format = export_config
         .get("format")
         .and_then(Value::as_str)
@@ -1186,6 +1204,7 @@ fn export_project(export_config: Value, project: Value) -> Result<ExportResult, 
         .and_then(Value::as_str)
         .ok_or_else(|| "No saved recording file was found. Record something first.".to_string())?;
     run_export(
+        &app,
         asset_path,
         format,
         resolution,
