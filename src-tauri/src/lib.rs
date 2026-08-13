@@ -805,7 +805,7 @@ fn map_source_time_to_output_ms(source_ms: f64, segments: &[EditSegment]) -> Opt
 }
 
 fn remap_mouse_events(events: &[MouseEventRecord], segments: &[EditSegment]) -> Vec<MouseEventRecord> {
-    events
+    let mut mapped = events
         .iter()
         .filter_map(|event| {
             let mapped = map_source_time_to_output_ms(event.timestamp as f64, segments)?;
@@ -813,7 +813,19 @@ fn remap_mouse_events(events: &[MouseEventRecord], segments: &[EditSegment]) -> 
             next.timestamp = mapped.round().max(0.0) as u128;
             Some(next)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    mapped.sort_by_key(|event| event.timestamp);
+    // Adjacent edit segments meet at the same output timestamp. Keep only the
+    // post-cut sample so interpolation jumps exactly as the preview seek does.
+    mapped.dedup_by(|next, previous| {
+        if next.timestamp == previous.timestamp {
+            *previous = next.clone();
+            true
+        } else {
+            false
+        }
+    });
+    mapped
 }
 
 fn remap_zoom_segments(
@@ -823,18 +835,31 @@ fn remap_zoom_segments(
 ) -> Vec<ExportZoomSegment> {
     zoom_segments
         .iter()
-        .filter_map(|segment| {
-            let mapped_start = map_source_time_to_output_ms(segment.start, segments)?;
-            let mapped_end = map_source_time_to_output_ms(segment.end, segments)
-                .unwrap_or(mapped_start + (segment.end - segment.start).max(100.0));
-            let mut next = segment.clone();
-            next.start = mapped_start;
-            next.end = mapped_end.max(mapped_start + 80.0);
-            if let Some(crop) = crop_rect {
-                next.center.x = (next.center.x - crop.x).max(0.0);
-                next.center.y = (next.center.y - crop.y).max(0.0);
-            }
-            Some(next)
+        .flat_map(|zoom| {
+            let intersections = if segments.is_empty() {
+                vec![(zoom.start, zoom.end)]
+            } else {
+                segments
+                    .iter()
+                    .filter_map(|edit| {
+                        let start = zoom.start.max(edit.source_start * 1000.0);
+                        let end = zoom.end.min(edit.source_end * 1000.0);
+                        (end > start).then_some((start, end))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            intersections.into_iter().filter_map(|(source_start, source_end)| {
+                let mapped_start = map_source_time_to_output_ms(source_start, segments)?;
+                let mapped_end = map_source_time_to_output_ms(source_end, segments)?;
+                let mut next = zoom.clone();
+                next.start = mapped_start;
+                next.end = mapped_end.max(mapped_start + 80.0);
+                if let Some(crop) = crop_rect {
+                    next.center.x = (next.center.x - crop.x).max(0.0);
+                    next.center.y = (next.center.y - crop.y).max(0.0);
+                }
+                Some(next)
+            })
         })
         .collect()
 }
@@ -863,10 +888,10 @@ fn build_linear_expr(samples: &[(f64, i32, i32)], axis: char) -> String {
         let start_value = value_at(&start) as f64;
         let end_value = value_at(&end) as f64;
         let duration = (end.0 - start.0).max(0.001);
-        let interpolated = format!(
-            "{start_value:.3}+({end_value:.3}-{start_value:.3})*((t-{:.3})/{duration:.3})",
-            start.0
-        );
+        let progress = format!("((t-{:.3})/{duration:.3})", start.0);
+        let eased = format!("({progress})*({progress})*(3-2*({progress}))");
+        let interpolated =
+            format!("{start_value:.3}+({end_value:.3}-{start_value:.3})*({eased})");
         expr = format!("if(between(t,{:.3},{:.3}),{interpolated},{expr})", start.0, end.0);
     }
 
@@ -935,14 +960,31 @@ fn build_cursor_filters(
             format!("gte(t,{enable_start:.3})*lt(t,{enable_end:.3})")
         };
 
-        if style.style == "ring" {
-            cursor_filters.push(format!(
-                "drawbox=x='({x_expr})-{half:.1}':y='({y_expr})-{half:.1}':w={size}:h={size}:color={color}@0.9:t=4:enable='{enable}'"
-            ));
-        } else if style.style == "dot" {
-            cursor_filters.push(format!(
-                "drawbox=x='({x_expr})-{half:.1}':y='({y_expr})-{half:.1}':w={size}:h={size}:color={color}@0.9:t=fill:enable='{enable}'"
-            ));
+        if style.style == "ring" || style.style == "dot" {
+            let bands = 9_u32;
+            let band_height = (size as f64 / bands as f64).ceil() as u32;
+            for band in 0..bands {
+                let normalized_y = ((band as f64 + 0.5) / bands as f64) * 2.0 - 1.0;
+                let width = (size as f64 * (1.0 - normalized_y * normalized_y).sqrt())
+                    .round()
+                    .max(2.0) as u32;
+                let offset_x = (size.saturating_sub(width)) as f64 / 2.0;
+                let offset_y = band * band_height;
+                if style.style == "dot" {
+                    cursor_filters.push(format!(
+                        "drawbox=x='({x_expr})-{half:.1}+{offset_x:.1}':y='({y_expr})-{half:.1}+{offset_y}':w={width}:h={band_height}:color={color}@0.9:t=fill:enable='{enable}'"
+                    ));
+                } else {
+                    let edge = 3_u32.min(width.div_ceil(2));
+                    cursor_filters.push(format!(
+                        "drawbox=x='({x_expr})-{half:.1}+{offset_x:.1}':y='({y_expr})-{half:.1}+{offset_y}':w={edge}:h={band_height}:color={color}@0.9:t=fill:enable='{enable}'"
+                    ));
+                    cursor_filters.push(format!(
+                        "drawbox=x='({x_expr})-{half:.1}+{:.1}':y='({y_expr})-{half:.1}+{offset_y}':w={edge}:h={band_height}:color={color}@0.9:t=fill:enable='{enable}'",
+                        offset_x + width.saturating_sub(edge) as f64
+                    ));
+                }
+            }
         } else {
             let step = (size / 4).max(2);
             cursor_filters.extend((0..4).map(|index| {
@@ -963,16 +1005,23 @@ fn build_cursor_filters(
             .take(80)
         {
             let start = event.timestamp as f64 / 1000.0;
-            let end = start + 0.45;
-            let ripple = (size as f64 * 1.4).round().max(14.0);
-            let ripple_half = ripple / 2.0;
-            filters.push(format!(
-                "drawbox=x='{:.1}':y='{:.1}':w={:.0}:h={:.0}:color={color}@0.45:t=3:enable='between(t,{start:.3},{end:.3})'",
-                event.x as f64 - ripple_half,
-                event.y as f64 - ripple_half,
-                ripple,
-                ripple
-            ));
+            let ripple = (size as f64 * 2.5).round().max(14.0);
+            for phase in 0..4 {
+                let phase_start = start + phase as f64 * 0.13;
+                let phase_end = phase_start + 0.13;
+                let progress = (phase as f64 + 1.0) / 4.0;
+                let eased = progress * progress * (3.0 - 2.0 * progress);
+                let diameter = ripple * (0.25 + 0.75 * eased);
+                let half = diameter / 2.0;
+                let alpha = 0.8 * (1.0 - eased);
+                filters.push(format!(
+                    "drawbox=x='{:.1}':y='{:.1}':w={:.0}:h={:.0}:color={color}@{alpha:.2}:t=3:enable='between(t,{phase_start:.3},{phase_end:.3})'",
+                    event.x as f64 - half,
+                    event.y as f64 - half,
+                    diameter,
+                    diameter
+                ));
+            }
         }
     }
 
@@ -1016,17 +1065,23 @@ fn build_zoom_filter(
         let scale = segment.scale.clamp(1.0, 4.0);
         let x = segment.center.x.max(0.0);
         let y = segment.center.y.max(0.0);
-        let ease = ((end - start) / 3.0).clamp(0.08, 0.24);
+        let ease = 0.36_f64.min((end - start) / 2.0).max(0.001);
         let active = format!("between(in_time,{start:.3},{end:.3})");
+        let enter_progress = format!("((in_time-{start:.3})/{ease:.3})");
+        let enter_eased = format!("({enter_progress})*({enter_progress})*(3-2*({enter_progress}))");
+        let exit_progress = format!("(({end:.3}-in_time)/{ease:.3})");
+        let exit_eased = format!("({exit_progress})*({exit_progress})*(3-2*({exit_progress}))");
         let zoom_value = format!(
-            "if(lt(in_time,{:.3}),1+({:.3}-1)*((in_time-{start:.3})/{ease:.3}),if(gt(in_time,{:.3}),1+({:.3}-1)*(({end:.3}-in_time)/{ease:.3}),{scale:.3}))",
+            "if(lt(in_time,{:.3}),1+({:.3}-1)*({enter_eased}),if(gt(in_time,{:.3}),1+({:.3}-1)*({exit_eased}),{scale:.3}))",
             start + ease,
             scale,
             end - ease,
             scale
         );
-        let crop_x = format!("min(max({x:.3}-(iw/zoom/2),0),iw-iw/zoom)");
-        let crop_y = format!("min(max({y:.3}-(ih/zoom/2),0),ih-ih/zoom)");
+        // Match CSS transform-origin: the clicked point stays at the same viewport
+        // position while the content scales around it.
+        let crop_x = format!("min(max({x:.3}*(1-1/zoom),0),iw-iw/zoom)");
+        let crop_y = format!("min(max({y:.3}*(1-1/zoom),0),ih-ih/zoom)");
         z_expr = format!("if({active},{zoom_value},{z_expr})");
         x_expr = format!("if({active},{crop_x},{x_expr})");
         y_expr = format!("if({active},{crop_y},{y_expr})");
@@ -1377,6 +1432,8 @@ mod tests {
 
         assert!(graph.contains("trim=start=0.000:end=2.000"));
         assert!(graph.contains("drawbox"));
+        assert!(graph.contains("0.640"));
+        assert!(graph.contains("w=70:h=70"));
         assert!(graph.contains("crop=640:360:10:20"));
         assert!(graph.contains("zoompan"));
         assert!(graph.contains("[vout]"));

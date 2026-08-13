@@ -66,6 +66,26 @@ export function activeZoomAt(
   return segments.find((segment) => timeMs >= segment.start && timeMs <= segment.end);
 }
 
+export const ZOOM_EASE_MS = 360;
+export const CLICK_RIPPLE_MS = 520;
+
+export function smoothstep(progress: number) {
+  const value = Math.min(1, Math.max(0, progress));
+  return value * value * (3 - 2 * value);
+}
+
+export function zoomScaleAt(segment: ZoomSegment | undefined, timeMs: number) {
+  if (!segment) return 1;
+  const easeMs = Math.min(ZOOM_EASE_MS, Math.max(1, (segment.end - segment.start) / 2));
+  if (timeMs < segment.start + easeMs) {
+    return 1 + (segment.scale - 1) * smoothstep((timeMs - segment.start) / easeMs);
+  }
+  if (timeMs > segment.end - easeMs) {
+    return 1 + (segment.scale - 1) * smoothstep((segment.end - timeMs) / easeMs);
+  }
+  return segment.scale;
+}
+
 export function formatTime(ms: number) {
   const seconds = Math.max(0, Math.floor(ms / 1000));
   const minutes = Math.floor(seconds / 60);

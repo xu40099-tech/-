@@ -29,7 +29,7 @@ import type {
   VideoEditState,
   ZoomSegment,
 } from "./types";
-import { activeZoomAt, createZoomForClick, formatTime, mergeSmartZooms } from "./zoom";
+import { activeZoomAt, CLICK_RIPPLE_MS, createZoomForClick, formatTime, mergeSmartZooms, smoothstep, zoomScaleAt } from "./zoom";
 
 const fallbackSources: CaptureSource[] = [
   { id: "current-display", name: "当前显示器", kind: "screen", width: 1920, height: 1080 },
@@ -157,7 +157,7 @@ function findMouseAt(events: MouseEventRecord[], timeMs: number) {
 
   const span = Math.max(1, next.timestamp - previous.timestamp);
   const progress = clamp((timeMs - previous.timestamp) / span, 0, 1);
-  const eased = progress * progress * (3 - 2 * progress);
+  const eased = smoothstep(progress);
 
   return {
     ...previous,
@@ -173,7 +173,7 @@ function activeClickAt(events: MouseEventRecord[], timeMs: number) {
     if (
       (event.action === "left_down" || event.action === "double_click" || event.action === "right_down") &&
       timeMs >= event.timestamp &&
-      timeMs <= event.timestamp + 520
+      timeMs <= event.timestamp + CLICK_RIPPLE_MS
     ) {
       return event;
     }
@@ -187,6 +187,36 @@ function sortedSegments(editState: VideoEditState, durationMs: number) {
     .filter((segment) => segment.sourceEnd - segment.sourceStart >= 80)
     .slice()
     .sort((a, b) => a.sourceStart - b.sourceStart);
+}
+
+function segmentAtSourceTime(segments: EditSegment[], sourceTimeMs: number) {
+  return segments.find(
+    (segment) => sourceTimeMs >= segment.sourceStart && sourceTimeMs < segment.sourceEnd,
+  );
+}
+
+function syncEditedPreview(video: HTMLVideoElement, segments: EditSegment[]) {
+  const sourceTimeMs = video.currentTime * 1000;
+  const active = segmentAtSourceTime(segments, sourceTimeMs);
+  if (active) {
+    if (Math.abs(video.playbackRate - active.speed) > 0.001) video.playbackRate = active.speed;
+    return sourceTimeMs;
+  }
+
+  const next = segments.find((segment) => segment.sourceStart > sourceTimeMs);
+  if (next) {
+    video.currentTime = next.sourceStart / 1000;
+    video.playbackRate = next.speed;
+    return next.sourceStart;
+  }
+
+  if (segments.length && sourceTimeMs < segments[0].sourceStart) {
+    video.currentTime = segments[0].sourceStart / 1000;
+    video.playbackRate = segments[0].speed;
+    return segments[0].sourceStart;
+  }
+  video.pause();
+  return segments.at(-1)?.sourceEnd ?? sourceTimeMs;
 }
 
 function App() {
@@ -224,10 +254,14 @@ function App() {
   const captureWidth = recordingConfig.captureBounds?.width ?? selectedSource?.width ?? 1920;
   const captureHeight = recordingConfig.captureBounds?.height ?? selectedSource?.height ?? 1080;
   const activeZoom = autoZoomEnabled ? activeZoomAt(zoomSegments, currentTime) : undefined;
+  const previewZoomScale = zoomScaleAt(activeZoom, currentTime);
   const visibleSegments = useMemo(() => sortedSegments(editState, duration), [duration, editState]);
   const selectedSegment = visibleSegments.find((segment) => segment.id === selectedSegmentId) ?? visibleSegments[0];
   const currentMouse = findMouseAt(mouseEvents, currentTime);
   const currentClick = activeClickAt(mouseEvents, currentTime);
+  const clickProgress = currentClick
+    ? smoothstep((currentTime - currentClick.timestamp) / CLICK_RIPPLE_MS)
+    : 0;
 
   useEffect(() => {
     safeInvoke<CaptureSource[]>("list_capture_sources").then((nativeSources) => {
@@ -255,14 +289,14 @@ function App() {
     const syncPreviewTime = () => {
       const video = videoRef.current;
       if (video && !video.paused && !video.ended) {
-        setCurrentTime(video.currentTime * 1000);
+        setCurrentTime(syncEditedPreview(video, visibleSegments));
       }
       frame = window.requestAnimationFrame(syncPreviewTime);
     };
 
     frame = window.requestAnimationFrame(syncPreviewTime);
     return () => window.cancelAnimationFrame(frame);
-  }, [recordingState, recordingUrl]);
+  }, [recordingState, recordingUrl, visibleSegments]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -545,13 +579,16 @@ function App() {
   }
 
   const elapsed = recordingState === "recording" ? currentTime : duration;
-  const zoomOriginX = activeZoom ? clamp((activeZoom.center.x / captureWidth) * 100, 0, 100) : 50;
-  const zoomOriginY = activeZoom ? clamp((activeZoom.center.y / captureHeight) * 100, 0, 100) : 50;
+  const crop = editState.cropRect;
+  const previewCrop = crop ?? { x: 0, y: 0, width: captureWidth, height: captureHeight };
+  const zoomOriginX = activeZoom ? clamp(((activeZoom.center.x - previewCrop.x) / previewCrop.width) * 100, 0, 100) : 50;
+  const zoomOriginY = activeZoom ? clamp(((activeZoom.center.y - previewCrop.y) / previewCrop.height) * 100, 0, 100) : 50;
   const cursorLeft = currentMouse ? clamp((currentMouse.x / captureWidth) * 100, 0, 100) : 50;
   const cursorTop = currentMouse ? clamp((currentMouse.y / captureHeight) * 100, 0, 100) : 50;
   const clickLeft = currentClick ? clamp((currentClick.x / captureWidth) * 100, 0, 100) : 50;
   const clickTop = currentClick ? clamp((currentClick.y / captureHeight) * 100, 0, 100) : 50;
-  const crop = editState.cropRect;
+  const cropScaleX = captureWidth / Math.max(1, previewCrop.width);
+  const cropScaleY = captureHeight / Math.max(1, previewCrop.height);
 
   return (
     <main className="record-shell">
@@ -727,17 +764,28 @@ function App() {
                 className="zoom-stage"
                 style={{
                   aspectRatio: `${captureWidth} / ${captureHeight}`,
-                  transform: `scale(${activeZoom ? activeZoom.scale : 1})`,
+                  transform: `scale(${previewZoomScale})`,
                   transformOrigin: `${zoomOriginX}% ${zoomOriginY}%`,
                 }}
               >
-                <video
-                  ref={videoRef}
-                  src={recordingUrl}
-                  controls
-                  onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime * 1000)}
-                  onSeeked={(event) => setCurrentTime(event.currentTarget.currentTime * 1000)}
-                />
+                <div className="preview-crop-viewport">
+                  <div
+                    className="preview-crop-content"
+                    style={{
+                      width: `${cropScaleX * 100}%`,
+                      height: `${cropScaleY * 100}%`,
+                      left: `${-(previewCrop.x / captureWidth) * cropScaleX * 100}%`,
+                      top: `${-(previewCrop.y / captureHeight) * cropScaleY * 100}%`,
+                    }}
+                  >
+                    <video
+                      ref={videoRef}
+                      src={recordingUrl}
+                      controls
+                      onPlay={(event) => setCurrentTime(syncEditedPreview(event.currentTarget, visibleSegments))}
+                      onTimeUpdate={(event) => setCurrentTime(syncEditedPreview(event.currentTarget, visibleSegments))}
+                      onSeeked={(event) => setCurrentTime(syncEditedPreview(event.currentTarget, visibleSegments))}
+                    />
                 {currentMouse && (
                   <div
                     className={`custom-cursor ${cursorStyle.style}`}
@@ -759,20 +807,13 @@ function App() {
                       width: `${cursorStyle.size * 2.5}px`,
                       height: `${cursorStyle.size * 2.5}px`,
                       borderColor: cursorStyle.color,
+                      opacity: 0.8 * (1 - clickProgress),
+                      transform: `translate(-50%, -50%) scale(${0.25 + clickProgress * 0.75})`,
                     }}
                   />
                 )}
-                {crop && (
-                  <div
-                    className="crop-preview"
-                    style={{
-                      left: `${(crop.x / captureWidth) * 100}%`,
-                      top: `${(crop.y / captureHeight) * 100}%`,
-                      width: `${(crop.width / captureWidth) * 100}%`,
-                      height: `${(crop.height / captureHeight) * 100}%`,
-                    }}
-                  />
-                )}
+                  </div>
+                </div>
               </div>
               </div>
             ) : recordingState === "recording" ? (
