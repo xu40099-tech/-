@@ -106,8 +106,10 @@ function safeExportName(name: string, fallback: string) {
     .trim()
     .replace(/\.[^.]+$/, "")
     .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
-    .replace(/\s+/g, " ");
-  return stem || fallback;
+    .replace(/\s+/g, " ")
+    .replace(/[ .]+$/, "");
+  const reserved = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(stem);
+  return stem && !reserved ? stem : fallback;
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -316,8 +318,8 @@ function App() {
         config: recordingConfig,
       });
       startedAtRef.current = performance.now();
-      updateRecordingConfig({ sourceType: "screen", sourceId: "current-display", captureBounds: native.region });
-      setSources([{ id: "current-display", name: "当前显示器", kind: "screen", width: native.region.width, height: native.region.height }]);
+      updateRecordingConfig({ sourceType: "screen", sourceId: "current-display", captureBounds: native.captureBounds });
+      setSources([{ id: "current-display", name: "当前显示器", kind: "screen", width: native.captureBounds.width, height: native.captureBounds.height }]);
       setRecordingNativePath(native.path);
       setRecordingState("recording");
       setStatus(`${native.message}，正在跟踪鼠标移动和点击。`);
@@ -334,7 +336,8 @@ function App() {
     try {
       const result = await invoke<NativeRecordingStopResult>("stop_recording");
       const previewUrl = await loadRecordingPreview(result.path, result.mimeType);
-      const normalizedEvents = normalizeMouseEvents(result.mouseEvents ?? [], recordingConfig.captureBounds);
+      updateRecordingConfig({ captureBounds: result.captureBounds });
+      const normalizedEvents = normalizeMouseEvents(result.mouseEvents ?? [], result.captureBounds);
       const zooms = buildZooms(normalizedEvents);
       const nextDuration = Math.max(Number(result.duration), 1_000);
       const fullSegment = createFullSegment(nextDuration);

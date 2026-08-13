@@ -146,7 +146,7 @@ export interface NativeRecordingStartResult {
   path: string;
   startedAt: number;
   message: string;
-  region: Region;
+  captureBounds: Region;
 }
 
 export interface NativeRecordingStopResult {
@@ -155,6 +155,7 @@ export interface NativeRecordingStopResult {
   mimeType: string;
   mouseEvents: MouseEventRecord[];
   message: string;
+  captureBounds: Region;
 }
 
 export interface ExportProjectResult {

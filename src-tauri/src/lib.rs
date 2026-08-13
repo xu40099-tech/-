@@ -63,6 +63,7 @@ struct NativeRecordingSession {
     mouse_stop: Arc<AtomicBool>,
     mouse_events: Arc<Mutex<Vec<MouseEventRecord>>>,
     mouse_thread: Option<JoinHandle<()>>,
+    capture_bounds: MonitorCaptureConfig,
 }
 
 #[derive(Serialize)]
@@ -71,7 +72,8 @@ struct NativeRecordingStartResult {
     #[serde(rename = "startedAt")]
     started_at: u128,
     message: String,
-    region: MonitorCaptureConfig,
+    #[serde(rename = "captureBounds")]
+    capture_bounds: MonitorCaptureConfig,
 }
 
 #[derive(Serialize)]
@@ -83,6 +85,8 @@ struct NativeRecordingStopResult {
     #[serde(rename = "mouseEvents")]
     mouse_events: Vec<MouseEventRecord>,
     message: String,
+    #[serde(rename = "captureBounds")]
+    capture_bounds: MonitorCaptureConfig,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -318,22 +322,37 @@ fn recording_output_path(extension: &str) -> Result<PathBuf, String> {
 }
 
 fn safe_file_stem(file_name: &str) -> String {
-    let sanitized = file_name
-        .trim()
-        .trim_end_matches(".mp4")
+    let trimmed = file_name.trim();
+    let without_extension = trimmed
+        .strip_suffix(".mp4")
+        .or_else(|| trimmed.strip_suffix(".MP4"))
+        .unwrap_or(trimmed);
+    let sanitized = without_extension
         .chars()
         .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == ' ' {
-                ch
-            } else {
+            if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+                || ch.is_control()
+            {
                 '_'
+            } else {
+                ch
             }
         })
         .collect::<String>()
-        .trim()
+        .trim_end_matches([' ', '.'])
         .to_string();
 
-    if sanitized.is_empty() {
+    let reserved = sanitized
+        .split('.')
+        .next()
+        .map(|stem| stem.to_ascii_uppercase())
+        .is_some_and(|stem| {
+            matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+                || stem.strip_prefix("COM").is_some_and(|number| matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
+                || stem.strip_prefix("LPT").is_some_and(|number| matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
+        });
+
+    if sanitized.is_empty() || reserved {
         format!("recording-{}", chrono_like_stamp())
     } else {
         sanitized
@@ -474,12 +493,16 @@ fn get_recordings_dir() -> Result<SaveResult, String> {
     })
 }
 
-fn current_main_monitor_config(app: &tauri::AppHandle) -> Result<MonitorCaptureConfig, String> {
+fn current_main_monitor_config(app: &tauri::AppHandle) -> Result<(MonitorCaptureConfig, usize), String> {
     let main = app.get_webview_window("main").ok_or_else(|| "找不到软件主窗口。".to_string())?;
     let monitor = main.current_monitor().map_err(|error| error.to_string())?.ok_or_else(|| "无法确定软件窗口所在的显示器。".to_string())?;
     let position = *monitor.position();
     let size = *monitor.size();
-    Ok(MonitorCaptureConfig { x: position.x, y: position.y, width: size.width, height: size.height, scale_factor: monitor.scale_factor() })
+    let monitors = app.available_monitors().map_err(|error| error.to_string())?;
+    if monitors.len() != 1 {
+        return Err("当前 Desktop Duplication 录制后端仅支持单显示器环境，请暂时只连接一台显示器后重试。".to_string());
+    }
+    Ok((MonitorCaptureConfig { x: position.x, y: position.y, width: size.width, height: size.height, scale_factor: monitor.scale_factor() }, 0))
 }
 
 #[tauri::command]
@@ -494,38 +517,48 @@ fn start_recording(
     }
 
     let fps = config.get("fps").and_then(Value::as_u64).unwrap_or(60);
-    let monitor = current_main_monitor_config(&app)?;
+    let (monitor, output_idx) = current_main_monitor_config(&app)?;
     let ffmpeg = ffmpeg_path(&app)
         .ok_or_else(|| "安装包中缺少 FFmpeg。".to_string())?;
     let output = recording_output_path("mp4")?;
 
     let mut command = Command::new(ffmpeg);
     hide_subprocess_window(&mut command);
-    command
-        .args(["-y", "-f", "gdigrab", "-framerate"])
-        .arg(fps.to_string())
-        .args(["-draw_mouse", "0"]);
-
-    command
-        .args(["-offset_x", &monitor.x.to_string()])
-        .args(["-offset_y", &monitor.y.to_string()])
-        .args(["-video_size", &format!("{}x{}", monitor.width, monitor.height)]);
+    let ddagrab = format!(
+        "ddagrab=output_idx={output_idx}:draw_mouse=0:framerate={fps}:video_size={}x{}",
+        monitor.width, monitor.height
+    );
+    command.args(["-y", "-f", "lavfi", "-i", &ddagrab]);
     let capture_message = format!("正在录制当前显示器（{}×{}）", monitor.width, monitor.height);
 
     command
-        .args(["-i", "desktop", "-c:v", "libx264", "-preset", "ultrafast"])
+        .args(["-vf", "hwdownload,format=bgra", "-c:v", "libx264", "-preset", "ultrafast"])
         .args(["-pix_fmt", "yuv420p"])
         .arg(&output)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
-    let child = command.spawn().map_err(|error| {
+    let mut child = command.spawn().map_err(|error| {
         format!(
             "无法通过 FFmpeg 启动 Windows 屏幕录制：{}",
             error
         )
     })?;
+    thread::sleep(Duration::from_millis(500));
+    if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+        let error_output = child
+            .stderr
+            .take()
+            .map(|mut stderr| {
+                use std::io::Read;
+                let mut body = String::new();
+                let _ = stderr.read_to_string(&mut body);
+                body.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+            })
+            .unwrap_or_default();
+        return Err(format!("Desktop Duplication 录制后端启动失败（{status}）：{error_output}"));
+    }
     let started_at = now_millis();
     let mouse_stop = Arc::new(AtomicBool::new(false));
     let mouse_events = Arc::new(Mutex::new(Vec::new()));
@@ -542,13 +575,14 @@ fn start_recording(
         mouse_stop,
         mouse_events,
         mouse_thread,
+        capture_bounds: monitor.clone(),
     });
 
     Ok(NativeRecordingStartResult {
         path: output.to_string_lossy().to_string(),
         started_at,
         message: format!("已开始以 {fps} 帧录制，{capture_message}"),
-        region: monitor,
+        capture_bounds: monitor,
     })
 }
 
@@ -581,13 +615,14 @@ fn stop_recording(
         let _ = stdin.flush();
     }
 
-    match session.child.wait() {
-        Ok(status) if status.success() => {}
+    let recording_succeeded = match session.child.wait() {
+        Ok(status) if status.success() => true,
         Ok(_) | Err(_) => {
             let _ = session.child.kill();
             let _ = session.child.wait();
+            false
         }
-    }
+    };
 
     session.mouse_stop.store(true, Ordering::Relaxed);
     if let Some(handle) = session.mouse_thread.take() {
@@ -599,12 +634,16 @@ fn stop_recording(
         .map(|events| events.clone())
         .unwrap_or_default();
     let duration = now_millis().saturating_sub(session.started_at);
+    if !recording_succeeded || !session.path.exists() {
+        return Err("屏幕录制进程异常退出，未生成有效的录制文件。".to_string());
+    }
     Ok(NativeRecordingStopResult {
         path: session.path.to_string_lossy().to_string(),
         duration,
         mime_type: "video/mp4".into(),
         mouse_events,
         message: "Windows 屏幕录制已停止。".into(),
+        capture_bounds: session.capture_bounds,
     })
 }
 
@@ -1194,6 +1233,16 @@ fn export_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_stem_preserves_chinese_and_replaces_windows_forbidden_characters() {
+        assert_eq!(safe_file_stem("产品演示 版本一.mp4"), "产品演示 版本一");
+        assert_eq!(safe_file_stem("产品演示.MP4"), "产品演示");
+        assert_eq!(safe_file_stem("产品:演示?.mp4"), "产品_演示_");
+        assert_eq!(safe_file_stem("中文名称.  "), "中文名称");
+        assert!(!safe_file_stem("CON").eq_ignore_ascii_case("CON"));
+        assert!(!safe_file_stem("LPT9").eq_ignore_ascii_case("LPT9"));
+    }
 
     #[test]
     fn filter_graph_contains_edit_cursor_crop_and_zoom_filters() {
