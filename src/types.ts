@@ -1,4 +1,4 @@
-export type CaptureSourceType = "screen" | "window" | "region";
+export type CaptureSourceType = "screen";
 export type FrameRate = 30 | 60;
 export type AspectRatio = "16:9" | "9:16" | "1:1" | "4:3" | "4:5";
 export type ExportFormat = "mp4" | "gif";
@@ -52,7 +52,7 @@ export interface VideoEditState {
 export interface RecordingConfig {
   sourceType: CaptureSourceType;
   sourceId: string;
-  region?: Region;
+  captureBounds?: Region;
   fps: FrameRate;
   microphoneEnabled: boolean;
   microphoneDeviceId?: string;
@@ -146,6 +146,7 @@ export interface NativeRecordingStartResult {
   path: string;
   startedAt: number;
   message: string;
+  region: Region;
 }
 
 export interface NativeRecordingStopResult {

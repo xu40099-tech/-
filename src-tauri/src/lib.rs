@@ -10,7 +10,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::Manager;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -18,7 +18,7 @@ use std::os::windows::process::CommandExt;
 use windows_sys::Win32::Foundation::POINT;
 #[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON, VK_RBUTTON,
+    GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
@@ -38,7 +38,7 @@ struct CaptureSource {
 }
 
 #[derive(Clone, Serialize)]
-struct RegionSelectorConfig {
+struct MonitorCaptureConfig {
     x: i32,
     y: i32,
     width: u32,
@@ -71,6 +71,7 @@ struct NativeRecordingStartResult {
     #[serde(rename = "startedAt")]
     started_at: u128,
     message: String,
+    region: MonitorCaptureConfig,
 }
 
 #[derive(Serialize)]
@@ -129,14 +130,6 @@ struct DirectExportInput {
     #[serde(rename = "editState")]
     edit_state: Option<VideoEditState>,
     fps: Option<u32>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-struct Region {
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
 }
 
 #[derive(Clone, Deserialize)]
@@ -227,7 +220,7 @@ fn app_root_dir() -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())?
         .parent()
         .map(PathBuf::from)
-        .ok_or_else(|| "Could not resolve application directory.".to_string())?;
+        .ok_or_else(|| "无法确定应用程序目录。".to_string())?;
 
     let candidates = [
         exe_dir.clone(),
@@ -464,40 +457,14 @@ fn spawn_mouse_recorder(
 
 #[tauri::command]
 fn list_capture_sources() -> Vec<CaptureSource> {
-    vec![
-        CaptureSource {
-            id: "display-1".into(),
-            name: "Display 1".into(),
-            kind: "screen".into(),
-            display_id: Some("DISPLAY1".into()),
-            width: Some(1920),
-            height: Some(1080),
-        },
-        CaptureSource {
-            id: "display-2".into(),
-            name: "Display 2".into(),
-            kind: "screen".into(),
-            display_id: Some("DISPLAY2".into()),
-            width: Some(2560),
-            height: Some(1440),
-        },
-        CaptureSource {
-            id: "active-window".into(),
-            name: "Active window".into(),
-            kind: "window".into(),
-            display_id: None,
-            width: Some(1440),
-            height: Some(900),
-        },
-        CaptureSource {
-            id: "custom-region".into(),
-            name: "Custom region".into(),
-            kind: "region".into(),
-            display_id: None,
-            width: Some(1280),
-            height: Some(720),
-        },
-    ]
+    vec![CaptureSource {
+        id: "current-display".into(),
+        name: "当前显示器".into(),
+        kind: "screen".into(),
+        display_id: None,
+        width: None,
+        height: None,
+    }]
 }
 
 #[tauri::command]
@@ -507,87 +474,12 @@ fn get_recordings_dir() -> Result<SaveResult, String> {
     })
 }
 
-fn current_main_monitor_config(app: &tauri::AppHandle) -> Result<RegionSelectorConfig, String> {
-    let main = app.get_webview_window("main").ok_or_else(|| "Main window was not found.".to_string())?;
-    let monitor = main.current_monitor().map_err(|error| error.to_string())?.ok_or_else(|| "Could not determine the monitor containing the main window.".to_string())?;
+fn current_main_monitor_config(app: &tauri::AppHandle) -> Result<MonitorCaptureConfig, String> {
+    let main = app.get_webview_window("main").ok_or_else(|| "找不到软件主窗口。".to_string())?;
+    let monitor = main.current_monitor().map_err(|error| error.to_string())?.ok_or_else(|| "无法确定软件窗口所在的显示器。".to_string())?;
     let position = *monitor.position();
     let size = *monitor.size();
-    Ok(RegionSelectorConfig { x: position.x, y: position.y, width: size.width, height: size.height, scale_factor: monitor.scale_factor() })
-}
-
-#[tauri::command]
-fn get_region_selector_config(app: tauri::AppHandle) -> Result<RegionSelectorConfig, String> {
-    current_main_monitor_config(&app)
-}
-
-#[cfg(windows)]
-fn spawn_region_selector_escape_guard(app: tauri::AppHandle) {
-    thread::spawn(move || {
-        let mut was_pressed = false;
-        while app.get_webview_window("region-selector").is_some() {
-            let is_pressed = unsafe { GetAsyncKeyState(VK_ESCAPE as i32) } < 0;
-            if is_pressed && !was_pressed {
-                if let Some(selector) = app.get_webview_window("region-selector") {
-                    let _ = selector.close();
-                }
-                break;
-            }
-            was_pressed = is_pressed;
-            thread::sleep(Duration::from_millis(25));
-        }
-    });
-}
-
-#[cfg(not(windows))]
-fn spawn_region_selector_escape_guard(_app: tauri::AppHandle) {}
-
-#[tauri::command]
-fn open_region_selector(app: tauri::AppHandle) -> Result<RegionSelectorConfig, String> {
-    if let Some(existing) = app.get_webview_window("region-selector") {
-        existing.close().map_err(|error| error.to_string())?;
-    }
-
-    let config = current_main_monitor_config(&app)?;
-    let logical_x = config.x as f64 / config.scale_factor;
-    let logical_y = config.y as f64 / config.scale_factor;
-    let logical_width = config.width as f64 / config.scale_factor;
-    let logical_height = config.height as f64 / config.scale_factor;
-
-    WebviewWindowBuilder::new(&app, "region-selector", WebviewUrl::App("region-selector.html".into()))
-        .title("Choose recording region")
-        .decorations(false)
-        .transparent(true)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .resizable(false)
-        .position(logical_x, logical_y)
-        .inner_size(logical_width, logical_height)
-        .build()
-        .map_err(|error| error.to_string())?;
-    spawn_region_selector_escape_guard(app.clone());
-
-    Ok(config)
-}
-
-#[tauri::command]
-fn complete_region_selection(
-    app: tauri::AppHandle,
-    region: Region,
-) -> Result<(), String> {
-    app.emit_to("main", "region-selected", region)
-        .map_err(|error| error.to_string())?;
-    if let Some(selector) = app.get_webview_window("region-selector") {
-        selector.close().map_err(|error| error.to_string())?;
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn cancel_region_selection(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(selector) = app.get_webview_window("region-selector") {
-        selector.close().map_err(|error| error.to_string())?;
-    }
-    Ok(())
+    Ok(MonitorCaptureConfig { x: position.x, y: position.y, width: size.width, height: size.height, scale_factor: monitor.scale_factor() })
 }
 
 #[tauri::command]
@@ -598,20 +490,13 @@ fn start_recording(
 ) -> Result<NativeRecordingStartResult, String> {
     let mut session = state.session.lock().map_err(|error| error.to_string())?;
     if session.is_some() {
-        return Err("Recording is already running.".into());
+        return Err("录制已在进行中。".into());
     }
 
     let fps = config.get("fps").and_then(Value::as_u64).unwrap_or(60);
-    let source_type = config
-        .get("sourceType")
-        .and_then(Value::as_str)
-        .unwrap_or("screen");
-    let region = config
-        .get("region")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<Region>(value).ok());
+    let monitor = current_main_monitor_config(&app)?;
     let ffmpeg = ffmpeg_path(&app)
-        .ok_or_else(|| "FFmpeg missing from installation package".to_string())?;
+        .ok_or_else(|| "安装包中缺少 FFmpeg。".to_string())?;
     let output = recording_output_path("mp4")?;
 
     let mut command = Command::new(ffmpeg);
@@ -621,18 +506,11 @@ fn start_recording(
         .arg(fps.to_string())
         .args(["-draw_mouse", "0"]);
 
-    let capture_message = if source_type == "region" {
-        let region = region.ok_or_else(|| "Draw a recording region before starting.".to_string())?;
-        let width = region.width.max(160);
-        let height = region.height.max(120);
-        command
-            .args(["-offset_x", &region.x.to_string()])
-            .args(["-offset_y", &region.y.to_string()])
-            .args(["-video_size", &format!("{width}x{height}")]);
-        format!("{width}x{height} region at {}, {}", region.x, region.y)
-    } else {
-        "desktop".into()
-    };
+    command
+        .args(["-offset_x", &monitor.x.to_string()])
+        .args(["-offset_y", &monitor.y.to_string()])
+        .args(["-video_size", &format!("{}x{}", monitor.width, monitor.height)]);
+    let capture_message = format!("正在录制当前显示器（{}×{}）", monitor.width, monitor.height);
 
     command
         .args(["-i", "desktop", "-c:v", "libx264", "-preset", "ultrafast"])
@@ -644,7 +522,7 @@ fn start_recording(
 
     let child = command.spawn().map_err(|error| {
         format!(
-            "Could not start native Windows recording through FFmpeg/gdigrab: {}",
+            "无法通过 FFmpeg 启动 Windows 屏幕录制：{}",
             error
         )
     })?;
@@ -669,21 +547,22 @@ fn start_recording(
     Ok(NativeRecordingStartResult {
         path: output.to_string_lossy().to_string(),
         started_at,
-        message: format!("Native Windows recording started at {fps}fps from {capture_message}"),
+        message: format!("已开始以 {fps} 帧录制，{capture_message}"),
+        region: monitor,
     })
 }
 
 #[tauri::command]
 fn pause_recording() -> CommandMessage {
     CommandMessage {
-        message: "Recording paused.".into(),
+        message: "录制已暂停。".into(),
     }
 }
 
 #[tauri::command]
 fn resume_recording() -> CommandMessage {
     CommandMessage {
-        message: "Recording resumed.".into(),
+        message: "录制已继续。".into(),
     }
 }
 
@@ -694,7 +573,7 @@ fn stop_recording(
     let mut guard = state.session.lock().map_err(|error| error.to_string())?;
     let mut session = guard
         .take()
-        .ok_or_else(|| "No native recording is running.".to_string())?;
+        .ok_or_else(|| "当前没有正在进行的录制。".to_string())?;
 
     if let Some(stdin) = session.child.stdin.as_mut() {
         use std::io::Write;
@@ -725,7 +604,7 @@ fn stop_recording(
         duration,
         mime_type: "video/mp4".into(),
         mouse_events,
-        message: "Native Windows recording stopped.".into(),
+        message: "Windows 屏幕录制已停止。".into(),
     })
 }
 
@@ -767,7 +646,7 @@ fn save_recording_asset(input: RecordingAssetInput) -> Result<AssetSaveResult, S
 fn rename_recording(input: RenameRecordingInput) -> Result<SaveResult, String> {
     let current_path = PathBuf::from(&input.path);
     if !current_path.exists() {
-        return Err(format!("Recording file was not found: {}", input.path));
+        return Err(format!("找不到录制文件：{}", input.path));
     }
 
     let extension = current_path
@@ -1159,11 +1038,11 @@ fn run_export(
 ) -> Result<ExportResult, String> {
     let input = PathBuf::from(asset_path);
     if !input.exists() {
-        return Err(format!("Recording file was not found: {asset_path}"));
+        return Err(format!("找不到录制文件：{asset_path}"));
     }
 
     let ffmpeg = ffmpeg_path(app)
-        .ok_or_else(|| "FFmpeg missing from installation package".to_string())?;
+        .ok_or_else(|| "安装包中缺少 FFmpeg。".to_string())?;
 
     let extension = if format == "gif" { "gif" } else { "mp4" };
     let output = if let Some(destination) = destination_path {
@@ -1231,7 +1110,7 @@ fn run_export(
             .collect::<Vec<_>>()
             .join("\n");
         return Err(if last_lines.trim().is_empty() {
-            "FFmpeg export failed without an error message.".into()
+            "FFmpeg 导出失败，且未返回错误信息。".into()
         } else {
             last_lines
         });
@@ -1241,7 +1120,7 @@ fn run_export(
     Ok(ExportResult {
         path: export_path.clone(),
         message: format!(
-            "Export complete: {export_path}, format {format} / {resolution}, project contains {zoom_count} zoom segments."
+            "导出完成：{export_path}，格式 {format} / {resolution}，项目包含 {zoom_count} 个缩放片段。"
         ),
     })
 }
@@ -1294,7 +1173,7 @@ fn export_project(
         .get("asset")
         .and_then(|asset| asset.get("nativePath"))
         .and_then(Value::as_str)
-        .ok_or_else(|| "No saved recording file was found. Record something first.".to_string())?;
+        .ok_or_else(|| "找不到已保存的录制文件，请先进行录制。".to_string())?;
     run_export(
         &app,
         asset_path,
@@ -1405,10 +1284,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_capture_sources,
             get_recordings_dir,
-            get_region_selector_config,
-            open_region_selector,
-            complete_region_selection,
-            cancel_region_selection,
             start_recording,
             pause_recording,
             resume_recording,

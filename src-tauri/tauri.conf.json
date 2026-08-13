@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Screen Studio MVP",
+        "title": "屏幕录制工作室",
         "width": 1440,
         "height": 920,
         "minWidth": 1120,

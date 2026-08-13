@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import {
   Circle,
@@ -33,15 +32,12 @@ import type {
 import { activeZoomAt, createZoomForClick, formatTime, mergeSmartZooms } from "./zoom";
 
 const fallbackSources: CaptureSource[] = [
-  { id: "display-1", name: "Display 1", kind: "screen", width: 1920, height: 1080 },
-  { id: "display-2", name: "Display 2", kind: "screen", width: 2560, height: 1440 },
-  { id: "window-active", name: "Active window", kind: "window", width: 1440, height: 900 },
-  { id: "custom-region", name: "Custom region", kind: "region", width: 1280, height: 720 },
+  { id: "current-display", name: "当前显示器", kind: "screen", width: 1920, height: 1080 },
 ];
 
 const defaultRecordingConfig: RecordingConfig = {
   sourceType: "screen",
-  sourceId: "display-1",
+  sourceId: "current-display",
   fps: 60,
   microphoneEnabled: false,
   systemAudioEnabled: false,
@@ -200,7 +196,7 @@ function App() {
   const [selectedSegmentId, setSelectedSegmentId] = useState<string>();
   const [selectionStart, setSelectionStart] = useState(0);
   const [selectionEnd, setSelectionEnd] = useState(0);
-  const [status, setStatus] = useState("Ready to record");
+  const [status, setStatus] = useState("准备录制");
   const [recordingState, setRecordingState] = useState<"idle" | "recording" | "ready">("idle");
   const [recordingUrl, setRecordingUrl] = useState<string>();
   const [recordingNativePath, setRecordingNativePath] = useState<string>();
@@ -223,12 +219,8 @@ function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
 
   const selectedSource = sources.find((source) => source.id === recordingConfig.sourceId) ?? sources[0];
-  const captureWidth = recordingConfig.sourceType === "region" && recordingConfig.region
-    ? recordingConfig.region.width
-    : selectedSource?.width ?? 1920;
-  const captureHeight = recordingConfig.sourceType === "region" && recordingConfig.region
-    ? recordingConfig.region.height
-    : selectedSource?.height ?? 1080;
+  const captureWidth = recordingConfig.captureBounds?.width ?? selectedSource?.width ?? 1920;
+  const captureHeight = recordingConfig.captureBounds?.height ?? selectedSource?.height ?? 1080;
   const activeZoom = autoZoomEnabled ? activeZoomAt(zoomSegments, currentTime) : undefined;
   const visibleSegments = useMemo(() => sortedSegments(editState, duration), [duration, editState]);
   const selectedSegment = visibleSegments.find((segment) => segment.id === selectedSegmentId) ?? visibleSegments[0];
@@ -242,17 +234,6 @@ function App() {
     safeInvoke<{ path: string }>("get_recordings_dir").then((result) => {
       if (result?.path) setRecordingsDir(result.path);
     });
-  }, []);
-
-  useEffect(() => {
-    const unlisten = listen<Region>("region-selected", ({ payload }) => {
-      updateRecordingConfig({ sourceId: "custom-region", sourceType: "region", region: payload });
-      setSources((current) => current.map((source) =>
-        source.kind === "region" ? { ...source, width: payload.width, height: payload.height } : source,
-      ));
-      setStatus(`Region selected: ${payload.width}x${payload.height} at ${payload.x}, ${payload.y}.`);
-    });
-    return () => { void unlisten.then((dispose) => dispose()); };
   }, []);
 
   useEffect(() => {
@@ -318,13 +299,7 @@ function App() {
   async function startRecording() {
     if (recordingState === "recording") return;
 
-    if (recordingConfig.sourceType === "region" && !recordingConfig.region) {
-      setStatus("Draw a recording region first.");
-      void beginRegionDraw();
-      return;
-    }
-
-    setStatus("Starting recording...");
+    setStatus("正在开始录制……");
     setRecordingUrl(undefined);
     setRecordingName("");
     setExportFileName("");
@@ -341,23 +316,25 @@ function App() {
         config: recordingConfig,
       });
       startedAtRef.current = performance.now();
+      updateRecordingConfig({ sourceType: "screen", sourceId: "current-display", captureBounds: native.region });
+      setSources([{ id: "current-display", name: "当前显示器", kind: "screen", width: native.region.width, height: native.region.height }]);
       setRecordingNativePath(native.path);
       setRecordingState("recording");
-      setStatus(`${native.message}. Mouse movement and clicks are being tracked.`);
+      setStatus(`${native.message}，正在跟踪鼠标移动和点击。`);
     } catch (error) {
-      setStatus(`Cannot start recording: ${error instanceof Error ? error.message : String(error)}`);
+      setStatus(`无法开始录制：${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
   async function stopRecording() {
     if (recordingState !== "recording") return;
 
-    setStatus("Stopping recording and loading preview...");
+    setStatus("正在停止录制并加载预览……");
 
     try {
       const result = await invoke<NativeRecordingStopResult>("stop_recording");
       const previewUrl = await loadRecordingPreview(result.path, result.mimeType);
-      const normalizedEvents = normalizeMouseEvents(result.mouseEvents ?? [], recordingConfig.region);
+      const normalizedEvents = normalizeMouseEvents(result.mouseEvents ?? [], recordingConfig.captureBounds);
       const zooms = buildZooms(normalizedEvents);
       const nextDuration = Math.max(Number(result.duration), 1_000);
       const fullSegment = createFullSegment(nextDuration);
@@ -374,9 +351,9 @@ function App() {
       setSelectionStart(0);
       setSelectionEnd(nextDuration);
       setRecordingState("ready");
-      setStatus(`Recording saved automatically: ${result.path}. ${zooms.length} click zoom segment(s) created.`);
+      setStatus(`录制已自动保存：${result.path}。已创建 ${zooms.length} 个点击缩放片段。`);
     } catch (error) {
-      setStatus(`Stop failed: ${error instanceof Error ? error.message : String(error)}`);
+      setStatus(`停止录制失败：${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -384,7 +361,7 @@ function App() {
     if (isExporting) return;
 
     if (!recordingNativePath) {
-      setStatus("Record first, then export.");
+      setStatus("请先完成录制，再进行导出。");
       return;
     }
 
@@ -392,13 +369,13 @@ function App() {
     if (!destinationPath) {
       destinationPath = await chooseExportPath();
       if (!destinationPath) {
-        setStatus("Export cancelled. Choose a save location to export.");
+        setStatus("已取消导出，请选择保存位置后重试。");
         return;
       }
     }
 
     setIsExporting(true);
-    setStatus(`Exporting ${exportConfig.format.toUpperCase()} ${exportConfig.resolution}...`);
+    setStatus(`正在导出 ${exportConfig.format.toUpperCase()} ${exportConfig.resolution}……`);
 
     try {
       const result = await invoke<ExportProjectResult>("export_recording", {
@@ -420,9 +397,9 @@ function App() {
         },
       });
       setExportPath(result.path);
-      setStatus(`Export complete: ${result.path}`);
+      setStatus(`导出完成：${result.path}`);
     } catch (error) {
-      setStatus(`Export failed: ${error instanceof Error ? error.message : String(error)}`);
+      setStatus(`导出失败：${error instanceof Error ? error.message : String(error)}`);
     } finally {
       setIsExporting(false);
     }
@@ -433,12 +410,12 @@ function App() {
 
     const nextName = recordingName.trim();
     if (!nextName) {
-      setStatus("Enter a recording name first.");
+      setStatus("请先输入录制名称。");
       return;
     }
 
     setIsRenaming(true);
-    setStatus("Saving recording name...");
+    setStatus("正在保存录制名称……");
 
     try {
       const result = await invoke<{ path: string }>("rename_recording", {
@@ -454,9 +431,9 @@ function App() {
       setExportFileName(`${fileStemFromPath(result.path)}-export`);
       setExportDestinationPath(undefined);
       setExportPath(undefined);
-      setStatus(`Recording renamed: ${result.path}`);
+      setStatus(`录制已重命名：${result.path}`);
     } catch (error) {
-      setStatus(`Rename failed: ${error instanceof Error ? error.message : String(error)}`);
+      setStatus(`重命名失败：${error instanceof Error ? error.message : String(error)}`);
     } finally {
       setIsRenaming(false);
     }
@@ -473,7 +450,7 @@ function App() {
     const fileName = `${safeExportName(exportFileName, fallbackName)}.${extension}`;
     const defaultPath = recordingsDir ? pathJoin(recordingsDir, fileName) : fileName;
     const selected = await save({
-      title: "Save exported recording",
+      title: "保存导出的录制文件",
       defaultPath,
       filters: [
         {
@@ -487,15 +464,6 @@ function App() {
     setExportDestinationPath(selected);
     setExportFileName(fileStemFromPath(selected));
     return selected;
-  }
-
-  async function beginRegionDraw() {
-    setStatus("Opening full-screen region selector...");
-    try {
-      await invoke("open_region_selector");
-    } catch (error) {
-      setStatus(`Cannot open region selector: ${error instanceof Error ? error.message : String(error)}`);
-    }
   }
 
   function updateCrop(patch: Partial<CropRect>) {
@@ -528,7 +496,7 @@ function App() {
     });
     setEditState((state) => ({ ...state, segments: nextSegments }));
     setSelectedSegmentId(nextSegments[0]?.id);
-    setStatus(`Deleted range ${formatTime(start)} - ${formatTime(end)} from the edit.`);
+    setStatus(`已从编辑中删除 ${formatTime(start)} - ${formatTime(end)}。`);
   }
 
   function trimSelectedToSelection() {
@@ -548,7 +516,7 @@ function App() {
           : segment,
       ),
     }));
-    setStatus(`Trimmed selected segment to ${formatTime(start)} - ${formatTime(end)}.`);
+    setStatus(`已将所选片段裁剪为 ${formatTime(start)} - ${formatTime(end)}。`);
   }
 
   function splitAtPlayhead() {
@@ -562,7 +530,7 @@ function App() {
       segments: visibleSegments.flatMap((segment) => (segment.id === selectedSegment.id ? [left, right] : [segment])),
     }));
     setSelectedSegmentId(right.id);
-    setStatus(`Split segment at ${formatTime(point)}.`);
+    setStatus(`已在 ${formatTime(point)} 分割片段。`);
   }
 
   function updateSelectedSpeed(speed: number) {
@@ -590,8 +558,8 @@ function App() {
             <Video size={20} />
           </div>
           <div>
-            <p>Screen Studio MVP</p>
-            <h1>Screen recorder with click zoom</h1>
+            <p>屏幕录制工作室</p>
+            <h1>支持点击自动缩放的屏幕录制工具</h1>
           </div>
         </div>
         <div className={`record-status ${recordingState}`}>{status}</div>
@@ -600,40 +568,12 @@ function App() {
       <section className="record-layout">
         <aside className="record-controls">
           <div className="control-group">
-            <h2>Source</h2>
-            <label>
-              Screen or window
-              <select
-                value={recordingConfig.sourceId}
-                onChange={(event) => {
-                  const next = sources.find((source) => source.id === event.target.value);
-                  updateRecordingConfig({
-                    sourceId: event.target.value,
-                    sourceType: next?.kind ?? "screen",
-                  });
-                }}
-              >
-                {sources.map((source) => (
-                  <option key={source.id} value={source.id}>
-                    {source.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button className="location-button" onClick={beginRegionDraw} disabled={recordingState === "recording"}>
-              <Monitor size={16} />
-              Draw region
-            </button>
-            {recordingConfig.region && (
-              <p className="small-note">
-                Region: {recordingConfig.region.width}x{recordingConfig.region.height} at {recordingConfig.region.x},{" "}
-                {recordingConfig.region.y}
-              </p>
-            )}
+            <h2>录制来源</h2>
+            <p className="small-note">自动录制软件窗口所在的当前显示器</p>
           </div>
 
           <div className="control-group">
-            <h2>Frame rate</h2>
+            <h2>帧率</h2>
             <div className="segmented">
               {[30, 60].map((fps) => (
                 <button
@@ -648,17 +588,17 @@ function App() {
           </div>
 
           <div className="control-group">
-            <h2>Auto zoom</h2>
+            <h2>自动缩放</h2>
             <label className="check-row">
               <input
                 type="checkbox"
                 checked={autoZoomEnabled}
                 onChange={(event) => setAutoZoomEnabled(event.target.checked)}
               />
-              Zoom into click location
+              自动放大点击位置
             </label>
             <label>
-              Scale {zoomScale.toFixed(2)}x
+              缩放倍数 {zoomScale.toFixed(2)}x
               <input
                 type="range"
                 min="1"
@@ -673,7 +613,7 @@ function App() {
               />
             </label>
             <label>
-              Duration {Math.round(zoomDuration)}ms
+              持续时间 {Math.round(zoomDuration)} 毫秒
               <input
                 type="range"
                 min="600"
@@ -690,9 +630,9 @@ function App() {
           </div>
 
           <div className="control-group">
-            <h2>Mouse</h2>
+            <h2>鼠标</h2>
             <label>
-              Size {cursorStyle.size}px
+              大小 {cursorStyle.size} 像素
               <input
                 type="range"
                 min="12"
@@ -703,20 +643,20 @@ function App() {
               />
             </label>
             <label>
-              Style
+              样式
               <select
                 value={cursorStyle.style}
                 onChange={(event) =>
                   setCursorStyle((current) => ({ ...current, style: event.target.value as CursorStyleConfig["style"] }))
                 }
               >
-                <option value="arrow">Arrow</option>
-                <option value="dot">Dot</option>
-                <option value="ring">Ring</option>
+                <option value="arrow">箭头</option>
+                <option value="dot">圆点</option>
+                <option value="ring">圆环</option>
               </select>
             </label>
             <label>
-              Color
+              颜色
               <input
                 type="color"
                 value={cursorStyle.color}
@@ -729,15 +669,15 @@ function App() {
                 checked={cursorStyle.clickRipple}
                 onChange={(event) => setCursorStyle((current) => ({ ...current, clickRipple: event.target.checked }))}
               />
-              Click ripple
+              点击波纹
             </label>
           </div>
 
           <div className="control-group">
-            <h2>Hotkeys</h2>
+            <h2>快捷键</h2>
             <div className="shortcut-list">
-              <span>Start: {recordingConfig.hotkeys.start}</span>
-              <span>Stop: {recordingConfig.hotkeys.stop}</span>
+              <span>开始：{recordingConfig.hotkeys.start}</span>
+              <span>停止：{recordingConfig.hotkeys.stop}</span>
             </div>
           </div>
 
@@ -745,12 +685,12 @@ function App() {
             {recordingState === "recording" ? (
               <button className="stop-button" onClick={stopRecording}>
                 <Square size={18} />
-                Stop recording
+                停止录制
               </button>
             ) : (
               <button className="start-button" onClick={startRecording}>
                 <Circle size={18} fill="currentColor" />
-                Start recording
+                开始录制
               </button>
             )}
           </div>
@@ -760,11 +700,9 @@ function App() {
           <div className="preview-header">
             <div>
               <strong>
-                {recordingConfig.sourceType === "region" && recordingConfig.region
-                  ? "Custom region"
-                  : selectedSource?.name ?? "Display"}
+                {selectedSource?.name ?? "当前显示器"}
               </strong>
-              <span>{recordingState === "recording" ? "Recording" : recordingUrl ? "Preview" : "Waiting"}</span>
+              <span>{recordingState === "recording" ? "录制中" : recordingUrl ? "预览" : "等待录制"}</span>
             </div>
             <div className="preview-metrics">
               <span>
@@ -834,28 +772,28 @@ function App() {
             ) : recordingState === "recording" ? (
               <div className="empty-recording live">
                 <Circle size={42} fill="currentColor" />
-                <strong>Recording</strong>
-                <span>Click anywhere on screen. After Stop, the preview will zoom into each click.</span>
+                <strong>正在录制</strong>
+                <span>点击屏幕任意位置，停止后预览会自动放大每次点击。</span>
               </div>
             ) : (
               <div className="empty-recording">
                 <Monitor size={54} />
-                <strong>Ready to record</strong>
-                <span>Choose a source and frame rate, then start recording.</span>
+                <strong>准备录制</strong>
+                <span>设置帧率后即可开始录制当前显示器。</span>
               </div>
             )}
           </div>
 
           <div className="editor-panel">
             <div className="editor-head">
-              <h2>Basic edit</h2>
+              <h2>基础编辑</h2>
               <button onClick={() => resetEditing()} disabled={!duration}>
-                Reset edit
+                重置编辑
               </button>
             </div>
             <div className="timeline-range">
               <label>
-                Selection start {formatTime(selectionStart)}
+                选择起点 {formatTime(selectionStart)}
                 <input
                   type="range"
                   min="0"
@@ -867,7 +805,7 @@ function App() {
                 />
               </label>
               <label>
-                Selection end {formatTime(selectionEnd)}
+                选择终点 {formatTime(selectionEnd)}
                 <input
                   type="range"
                   min="0"
@@ -881,13 +819,13 @@ function App() {
             </div>
             <div className="edit-actions">
               <button onClick={trimSelectedToSelection} disabled={!selectedSegment}>
-                Trim selected
+                裁剪所选片段
               </button>
               <button onClick={splitAtPlayhead} disabled={!selectedSegment}>
-                Split at playhead
+                在播放位置分割
               </button>
               <button onClick={deleteSelection} disabled={!selectedSegment}>
-                Delete range
+                删除所选范围
               </button>
             </div>
             <div className="segment-list">
@@ -897,13 +835,13 @@ function App() {
                   className={segment.id === selectedSegment?.id ? "segment-chip selected" : "segment-chip"}
                   onClick={() => setSelectedSegmentId(segment.id)}
                 >
-                  Clip {index + 1}: {formatTime(segment.sourceStart)} - {formatTime(segment.sourceEnd)} /{" "}
+                  片段 {index + 1}：{formatTime(segment.sourceStart)} - {formatTime(segment.sourceEnd)} /{" "}
                   {segment.speed.toFixed(1)}x
                 </button>
               ))}
             </div>
             <label className="speed-control">
-              Selected speed {selectedSegment?.speed.toFixed(1) ?? "1.0"}x
+              所选片段速度 {selectedSegment?.speed.toFixed(1) ?? "1.0"}x
               <input
                 type="range"
                 min="0.25"
@@ -915,7 +853,7 @@ function App() {
               />
             </label>
             <div className="crop-controls">
-              <h2>Crop frame</h2>
+              <h2>裁剪画面</h2>
               <div className="crop-grid">
                 <label>
                   X
@@ -959,10 +897,10 @@ function App() {
                   onClick={() => setEditState((state) => ({ ...state, cropRect: { x: 0, y: 0, width: captureWidth, height: captureHeight } }))}
                   disabled={!duration}
                 >
-                  Full frame
+                  完整画面
                 </button>
                 <button onClick={() => setEditState((state) => ({ ...state, cropRect: undefined }))} disabled={!duration}>
-                  Clear crop
+                  清除裁剪
                 </button>
               </div>
             </div>
@@ -971,7 +909,7 @@ function App() {
 
         <aside className="export-panel">
           <div className="control-group">
-            <h2>Export</h2>
+            <h2>导出</h2>
             <div className="segmented">
               {(["mp4", "gif"] as const).map((format) => (
                 <button
@@ -998,10 +936,10 @@ function App() {
               ))}
             </div>
             <label>
-              Export name
+              导出名称
               <input
                 value={exportFileName}
-                placeholder="Export file name"
+                placeholder="输入导出文件名"
                 disabled={recordingState !== "ready" || isExporting}
                 onChange={(event) => {
                   setExportFileName(event.target.value);
@@ -1015,7 +953,7 @@ function App() {
               disabled={recordingState !== "ready" || !recordingNativePath || isExporting}
             >
               <FolderOpen size={16} />
-              Choose location
+              选择保存位置
             </button>
             {exportDestinationPath && <p className="destination-path">{exportDestinationPath}</p>}
             <button
@@ -1024,17 +962,17 @@ function App() {
               disabled={recordingState !== "ready" || !recordingNativePath || isExporting}
             >
               <Download size={18} />
-              {isExporting ? "Exporting" : "Export file"}
+              {isExporting ? "正在导出" : "导出文件"}
             </button>
           </div>
 
           <div className="file-info">
-            <h2>Auto save</h2>
-            <p>{recordingsDir ? `Folder: ${recordingsDir}` : "Preparing recordings folder..."}</p>
-            <h2>Recording name</h2>
+            <h2>自动保存</h2>
+            <p>{recordingsDir ? `文件夹：${recordingsDir}` : "正在准备录制文件夹……"}</p>
+            <h2>录制名称</h2>
             <input
               value={recordingName}
-              placeholder="Name this recording"
+              placeholder="为本次录制命名"
               disabled={!recordingNativePath || recordingState === "recording" || isRenaming}
               onChange={(event) => setRecordingName(event.target.value)}
               onKeyDown={(event) => {
@@ -1047,11 +985,11 @@ function App() {
               disabled={!recordingNativePath || recordingState !== "ready" || isRenaming}
             >
               <Save size={16} />
-              {isRenaming ? "Saving name" : "Save name"}
+              {isRenaming ? "正在保存名称" : "保存名称"}
             </button>
-            <h2>Latest recording</h2>
-            <p>{recordingNativePath ?? "No recording yet"}</p>
-            {exportPath && <p>Export: {exportPath}</p>}
+            <h2>最新录制</h2>
+            <p>{recordingNativePath ?? "暂无录制"}</p>
+            {exportPath && <p>导出文件：{exportPath}</p>}
           </div>
         </aside>
       </section>
