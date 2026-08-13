@@ -916,20 +916,28 @@ fn build_cursor_filters(
 
     let x_expr = build_linear_expr(&samples, 'x');
     let y_expr = build_linear_expr(&samples, 'y');
-    let cursor_filter = if style.style == "ring" {
-        format!(
+    let cursor_filters = if style.style == "ring" {
+        vec![format!(
             "drawbox=x='({x_expr})-{half:.1}':y='({y_expr})-{half:.1}':w={size}:h={size}:color={color}@0.9:t=4"
-        )
+        )]
     } else if style.style == "dot" {
-        format!(
+        vec![format!(
             "drawbox=x='({x_expr})-{half:.1}':y='({y_expr})-{half:.1}':w={size}:h={size}:color={color}@0.9:t=fill"
-        )
+        )]
     } else {
-        let width = (size as f64 * 0.72).round().max(6.0) as u32;
-        format!("drawbox=x='{x_expr}':y='{y_expr}':w={width}:h={size}:color={color}@0.9:t=fill")
+        let step = (size / 4).max(2);
+        (0..4)
+            .map(|index| {
+                let offset = index * step;
+                let width = ((index + 1) * step).min(size);
+                format!(
+                    "drawbox=x='({x_expr})':y='({y_expr})+{offset}':w={width}:h={step}:color={color}@0.9:t=fill"
+                )
+            })
+            .collect()
     };
 
-    let mut filters = vec![cursor_filter];
+    let mut filters = cursor_filters;
     if style.click_ripple {
         for event in events
             .iter()
@@ -1105,8 +1113,17 @@ fn run_export(
             extension
         ))
     };
+    if fs::canonicalize(&input).ok() == fs::canonicalize(&output).ok() && output.exists() {
+        return Err("导出位置不能与原始录制文件相同，请选择其他文件名。".to_string());
+    }
 
-    let mut command = Command::new(ffmpeg);
+    let temporary_output = output.with_file_name(format!(
+        ".screen-studio-export-{}.{}",
+        now_millis(), extension
+    ));
+    let _ = fs::remove_file(&temporary_output);
+
+    let mut command = Command::new(&ffmpeg);
     hide_subprocess_window(&mut command);
     command.arg("-y").arg("-i").arg(asset_path);
     let export_fps = if format == "gif" { 15 } else { fps };
@@ -1133,11 +1150,19 @@ fn run_export(
         command.args(["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-an"]);
     }
 
-    command.arg(&output);
+    command.arg(&temporary_output);
 
-    let output_result = command.output().map_err(|error| error.to_string())?;
+    let output_result = match command.output() {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = fs::remove_file(&filter_script);
+            let _ = fs::remove_file(&temporary_output);
+            return Err(error.to_string());
+        }
+    };
     let _ = fs::remove_file(&filter_script);
     if !output_result.status.success() {
+        let _ = fs::remove_file(&temporary_output);
         let stderr = String::from_utf8_lossy(&output_result.stderr);
         let last_lines = stderr
             .lines()
@@ -1154,6 +1179,47 @@ fn run_export(
             last_lines
         });
     }
+
+    let validation = Command::new(&ffmpeg)
+        .args(["-hide_banner", "-v", "error", "-i"])
+        .arg(&temporary_output)
+        .args(["-map", "0:v:0", "-f", "null", "-"])
+        .output();
+    let validation = match validation {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary_output);
+            return Err(error.to_string());
+        }
+    };
+    let valid_size = fs::metadata(&temporary_output)
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(false);
+    if !validation.status.success() || !valid_size {
+        let validation_error = String::from_utf8_lossy(&validation.stderr).trim().to_string();
+        let _ = fs::remove_file(&temporary_output);
+        return Err(if validation_error.is_empty() {
+            "导出文件验证失败，未生成有效的视频流。".into()
+        } else {
+            format!("导出文件验证失败：{validation_error}")
+        });
+    }
+
+    let backup = output.with_file_name(format!(".screen-studio-backup-{}", now_millis()));
+    if output.exists() {
+        fs::rename(&output, &backup).map_err(|error| {
+            let _ = fs::remove_file(&temporary_output);
+            format!("无法准备替换已有导出文件：{error}")
+        })?;
+    }
+    if let Err(error) = fs::rename(&temporary_output, &output) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &output);
+        }
+        let _ = fs::remove_file(&temporary_output);
+        return Err(format!("无法保存导出文件：{error}"));
+    }
+    let _ = fs::remove_file(&backup);
 
     let export_path = output.to_string_lossy().to_string();
     Ok(ExportResult {
@@ -1296,6 +1362,56 @@ mod tests {
         assert!(graph.contains("crop=640:360:10:20"));
         assert!(graph.contains("zoompan"));
         assert!(graph.contains("[vout]"));
+    }
+
+    #[test]
+    fn generated_filter_graph_is_accepted_by_ffmpeg() {
+        let ffmpeg = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("node_modules")
+            .join("ffmpeg-static")
+            .join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+        if !ffmpeg.exists() {
+            return;
+        }
+        let graph = build_video_filter_graph(
+            "1080p",
+            30,
+            &[ExportZoomSegment {
+                start: 200.0,
+                end: 900.0,
+                center: ExportZoomPoint { x: 320.0, y: 180.0 },
+                scale: 1.8,
+            }],
+            &[MouseEventRecord {
+                id: "mouse-1".into(), timestamp: 240, x: 320, y: 180,
+                action: "left_down".into(), click_count: Some(1), cursor_state: "default".into(),
+            }],
+            Some(&CursorStyleConfig { size: 28.0, style: "arrow".into(), color: "#ffffff".into(), click_ripple: true, smooth_path: true }),
+            None,
+            640.0,
+            360.0,
+        );
+        let script = std::env::temp_dir().join(format!("screen-studio-filter-{}.txt", now_millis()));
+        fs::write(&script, graph).unwrap();
+        let result = Command::new(ffmpeg)
+            .args(["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=640x360:r=30:d=1"])
+            .arg("-filter_complex_script").arg(&script)
+            .args(["-map", "[vout]", "-frames:v", "1", "-f", "null", "-"])
+            .output().unwrap();
+        let _ = fs::remove_file(script);
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    }
+
+    #[test]
+    fn export_uses_temporary_file_before_final_destination() {
+        let destination = PathBuf::from(r"C:\Users\Test\Downloads\中文导出.mp4");
+        let extension = "mp4";
+        let temporary = destination.with_file_name(format!(
+            ".screen-studio-export-{}.{}", 1234, extension
+        ));
+        assert_eq!(temporary.file_name().unwrap(), ".screen-studio-export-1234.mp4");
+        assert_ne!(temporary, destination);
     }
 
     #[test]

@@ -722,9 +722,11 @@ function App() {
 
           <div className="video-frame">
             {recordingUrl ? (
+              <div className="zoom-stage-wrap">
               <div
                 className="zoom-stage"
                 style={{
+                  aspectRatio: `${captureWidth} / ${captureHeight}`,
                   transform: `scale(${activeZoom ? activeZoom.scale : 1})`,
                   transformOrigin: `${zoomOriginX}% ${zoomOriginY}%`,
                 }}
@@ -771,6 +773,7 @@ function App() {
                     }}
                   />
                 )}
+              </div>
               </div>
             ) : recordingState === "recording" ? (
               <div className="empty-recording live">
