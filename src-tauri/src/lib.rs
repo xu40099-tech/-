@@ -914,28 +914,46 @@ fn build_cursor_filters(
         return Vec::new();
     }
 
-    let x_expr = build_linear_expr(&samples, 'x');
-    let y_expr = build_linear_expr(&samples, 'y');
-    let cursor_filters = if style.style == "ring" {
-        vec![format!(
-            "drawbox=x='({x_expr})-{half:.1}':y='({y_expr})-{half:.1}':w={size}:h={size}:color={color}@0.9:t=4"
-        )]
-    } else if style.style == "dot" {
-        vec![format!(
-            "drawbox=x='({x_expr})-{half:.1}':y='({y_expr})-{half:.1}':w={size}:h={size}:color={color}@0.9:t=fill"
-        )]
-    } else {
-        let step = (size / 4).max(2);
-        (0..4)
-            .map(|index| {
+    // FFmpeg's expression parser has a finite nesting depth. A complete recording can
+    // contain hundreds of mouse samples, so split the path into independently enabled
+    // chunks instead of building one deeply nested expression.
+    const SAMPLES_PER_FILTER: usize = 40;
+    let chunk_count = samples.len().saturating_sub(1).div_ceil(SAMPLES_PER_FILTER).max(1);
+    let mut cursor_filters = Vec::new();
+    for chunk_index in 0..chunk_count {
+        let start_index = chunk_index * SAMPLES_PER_FILTER;
+        let end_index = ((chunk_index + 1) * SAMPLES_PER_FILTER)
+            .min(samples.len().saturating_sub(1));
+        let chunk = &samples[start_index..=end_index];
+        let x_expr = build_linear_expr(chunk, 'x');
+        let y_expr = build_linear_expr(chunk, 'y');
+        let enable_start = if chunk_index == 0 { 0.0 } else { chunk[0].0 };
+        let enable_end = if chunk_index + 1 == chunk_count { 86_400.0 } else { chunk.last().unwrap().0 };
+        let enable = if chunk_index + 1 == chunk_count {
+            format!("between(t,{enable_start:.3},{enable_end:.3})")
+        } else {
+            format!("gte(t,{enable_start:.3})*lt(t,{enable_end:.3})")
+        };
+
+        if style.style == "ring" {
+            cursor_filters.push(format!(
+                "drawbox=x='({x_expr})-{half:.1}':y='({y_expr})-{half:.1}':w={size}:h={size}:color={color}@0.9:t=4:enable='{enable}'"
+            ));
+        } else if style.style == "dot" {
+            cursor_filters.push(format!(
+                "drawbox=x='({x_expr})-{half:.1}':y='({y_expr})-{half:.1}':w={size}:h={size}:color={color}@0.9:t=fill:enable='{enable}'"
+            ));
+        } else {
+            let step = (size / 4).max(2);
+            cursor_filters.extend((0..4).map(|index| {
                 let offset = index * step;
                 let width = ((index + 1) * step).min(size);
                 format!(
-                    "drawbox=x='({x_expr})':y='({y_expr})+{offset}':w={width}:h={step}:color={color}@0.9:t=fill"
+                    "drawbox=x='({x_expr})':y='({y_expr})+{offset}':w={width}:h={step}:color={color}@0.9:t=fill:enable='{enable}'"
                 )
-            })
-            .collect()
-    };
+            }));
+        }
+    }
 
     let mut filters = cursor_filters;
     if style.click_ripple {
@@ -1374,30 +1392,38 @@ mod tests {
         if !ffmpeg.exists() {
             return;
         }
+        let mouse_events = (0..900)
+            .map(|index| MouseEventRecord {
+                id: format!("mouse-{index}"),
+                timestamp: index * 16,
+                x: 80 + (index % 480) as i32,
+                y: 60 + (index % 240) as i32,
+                action: if index == 300 { "left_down".into() } else { "move".into() },
+                click_count: (index == 300).then_some(1),
+                cursor_state: "default".into(),
+            })
+            .collect::<Vec<_>>();
         let graph = build_video_filter_graph(
-            "1080p",
-            30,
+            "720p",
+            10,
             &[ExportZoomSegment {
                 start: 200.0,
                 end: 900.0,
                 center: ExportZoomPoint { x: 320.0, y: 180.0 },
                 scale: 1.8,
             }],
-            &[MouseEventRecord {
-                id: "mouse-1".into(), timestamp: 240, x: 320, y: 180,
-                action: "left_down".into(), click_count: Some(1), cursor_state: "default".into(),
-            }],
+            &mouse_events,
             Some(&CursorStyleConfig { size: 28.0, style: "arrow".into(), color: "#ffffff".into(), click_ripple: true, smooth_path: true }),
             None,
-            640.0,
-            360.0,
+            320.0,
+            180.0,
         );
         let script = std::env::temp_dir().join(format!("screen-studio-filter-{}.txt", now_millis()));
         fs::write(&script, graph).unwrap();
         let result = Command::new(ffmpeg)
-            .args(["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=640x360:r=30:d=1"])
+            .args(["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x180:r=10:d=15"])
             .arg("-filter_complex_script").arg(&script)
-            .args(["-map", "[vout]", "-frames:v", "1", "-f", "null", "-"])
+            .args(["-map", "[vout]", "-f", "null", "-"])
             .output().unwrap();
         let _ = fs::remove_file(script);
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
