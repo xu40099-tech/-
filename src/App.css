@@ -445,8 +445,12 @@ button.selected {
 }
 
 .click-ripple {
-  border: 3px solid;
-  border-radius: 999px;
+  align-items: center;
+  display: flex;
+  font-family: "Segoe UI Symbol", "Segoe UI", sans-serif;
+  font-size: 100%;
+  justify-content: center;
+  line-height: 1;
 }
 
 .editor-panel {

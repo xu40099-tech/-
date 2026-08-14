@@ -61,6 +61,7 @@ const defaultCursorStyle: CursorStyleConfig = {
   color: "#ffffff",
   clickRipple: true,
   smoothPath: true,
+  rippleSize: 70,
 };
 
 const defaultEditState: VideoEditState = {
@@ -233,7 +234,7 @@ function App() {
   const selectedSegment = visibleSegments.find((segment) => segment.id === selectedSegmentId) ?? visibleSegments[0];
   const currentClick = activeClickAt(mouseEvents, currentTime);
   const clickProgress = currentClick
-    ? smoothstep((currentTime - currentClick.timestamp) / CLICK_RIPPLE_MS)
+    ? smoothstep(Math.min(7, Math.floor(((currentTime - currentClick.timestamp) / CLICK_RIPPLE_MS) * 8)) / 7)
     : 0;
 
   useEffect(() => {
@@ -682,6 +683,17 @@ function App() {
               />
               点击波纹
             </label>
+            <label>
+              点击圆环大小 {cursorStyle.rippleSize} 像素
+              <input
+                type="range"
+                min="24"
+                max="180"
+                step="2"
+                value={cursorStyle.rippleSize}
+                onChange={(event) => setCursorStyle((current) => ({ ...current, rippleSize: Number(event.target.value) }))}
+              />
+            </label>
           </div>
 
           <div className="control-group">
@@ -770,13 +782,14 @@ function App() {
                     style={{
                       left: `${clickLeft}%`,
                       top: `${clickTop}%`,
-                      width: `${cursorStyle.size * 2.5}px`,
-                      height: `${cursorStyle.size * 2.5}px`,
-                      borderColor: cursorStyle.color,
+                      width: `${cursorStyle.rippleSize}px`,
+                      height: `${cursorStyle.rippleSize}px`,
+                      fontSize: `${cursorStyle.rippleSize}px`,
+                      color: cursorStyle.color,
                       opacity: 0.8 * (1 - clickProgress),
                       transform: `translate(-50%, -50%) scale(${0.25 + clickProgress * 0.75})`,
                     }}
-                  />
+                  >○</div>
                 )}
                   </div>
                 </div>

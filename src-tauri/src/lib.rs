@@ -147,6 +147,8 @@ struct CursorStyleConfig {
     click_ripple: bool,
     #[serde(rename = "smoothPath")]
     smooth_path: bool,
+    #[serde(rename = "rippleSize", default)]
+    ripple_size: Option<f64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -585,7 +587,7 @@ fn start_recording(
         .get("cursorStyle")
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or(CursorStyleConfig { size: 28.0, style: "arrow".into(), color: "#ffffff".into(), click_ripple: true, smooth_path: true });
+        .unwrap_or(CursorStyleConfig { size: 28.0, style: "arrow".into(), color: "#ffffff".into(), click_ripple: true, smooth_path: true, ripple_size: Some(70.0) });
     let (monitor, output_idx) = current_main_monitor_config(&app)?;
     let ffmpeg = ffmpeg_path(&app)
         .ok_or_else(|| "安装包中缺少 FFmpeg。".to_string())?;
@@ -1157,21 +1159,20 @@ fn build_cursor_filters(
             .take(80)
         {
             let start = event.timestamp as f64 / 1000.0;
-            let ripple = (size as f64 * 2.5).round().max(14.0);
-            for phase in 0..4 {
-                let phase_start = start + phase as f64 * 0.13;
-                let phase_end = phase_start + 0.13;
-                let progress = (phase as f64 + 1.0) / 4.0;
+            let ripple = style.ripple_size.unwrap_or(70.0).clamp(24.0, 180.0);
+            const RIPPLE_PHASES: usize = 8;
+            let phase_duration = 0.52 / RIPPLE_PHASES as f64;
+            for phase in 0..RIPPLE_PHASES {
+                let phase_start = start + phase as f64 * phase_duration;
+                let phase_end = phase_start + phase_duration;
+                let progress = phase as f64 / (RIPPLE_PHASES - 1) as f64;
                 let eased = progress * progress * (3.0 - 2.0 * progress);
                 let diameter = ripple * (0.25 + 0.75 * eased);
-                let half = diameter / 2.0;
                 let alpha = 0.8 * (1.0 - eased);
                 filters.push(format!(
-                    "drawbox=x='{:.1}':y='{:.1}':w={:.0}:h={:.0}:color={color}@{alpha:.2}:t=3:enable='between(t,{phase_start:.3},{phase_end:.3})'",
-                    event.x as f64 - half,
-                    event.y as f64 - half,
-                    diameter,
-                    diameter
+                    "drawtext=fontfile='C\\:/Windows/Fonts/seguisym.ttf':text='○':fontcolor={color}@{alpha:.3}:fontsize={diameter:.1}:x='{:.1}-text_w/2':y='{:.1}-text_h/2':enable='gte(t,{phase_start:.3})*lt(t,{phase_end:.3})'",
+                    event.x,
+                    event.y
                 ));
             }
         }
@@ -1640,6 +1641,7 @@ mod tests {
             color: "#ffffff".into(),
             click_ripple: true,
             smooth_path: true,
+            ripple_size: Some(70.0),
         };
         let graph = build_video_filter_graph(
             "1080p",
@@ -1669,7 +1671,8 @@ mod tests {
         assert!(graph.contains("trim=start=0.000:end=2.000"));
         assert!(graph.contains("drawbox"));
         assert!(graph.contains("0.640"));
-        assert!(graph.contains("w=70:h=70"));
+        assert!(graph.contains("drawtext=fontfile='C\\:/Windows/Fonts/seguisym.ttf':text='○'"));
+        assert!(!graph.contains("w=70:h=70"));
         assert!(graph.contains("crop=640:360:10:20"));
         assert!(graph.contains("zoompan"));
         assert!(graph.contains("[vout]"));
@@ -1680,7 +1683,7 @@ mod tests {
             Some(&cursor_style), None, 1280.0, 720.0, true,
         );
         assert!(!baked_graph.contains("[1:v]"));
-        assert!(baked_graph.contains("between(t,0.240"));
+        assert!(baked_graph.contains("gte(t,0.240)"));
     }
 
     #[test]
@@ -1714,7 +1717,7 @@ mod tests {
                 scale: 1.8,
             }],
             &mouse_events,
-            Some(&CursorStyleConfig { size: 28.0, style: "arrow".into(), color: "#ffffff".into(), click_ripple: true, smooth_path: true }),
+            Some(&CursorStyleConfig { size: 28.0, style: "arrow".into(), color: "#ffffff".into(), click_ripple: true, smooth_path: true, ripple_size: Some(70.0) }),
             None,
             320.0,
             180.0,
@@ -1723,7 +1726,7 @@ mod tests {
         let script = std::env::temp_dir().join(format!("screen-studio-filter-{}.txt", now_millis()));
         let cursor = std::env::temp_dir().join(format!("screen-studio-cursor-{}.png", now_millis()));
         fs::write(&script, graph).unwrap();
-        write_cursor_png(&cursor, &CursorStyleConfig { size: 28.0, style: "arrow".into(), color: "#ffffff".into(), click_ripple: true, smooth_path: true }).unwrap();
+        write_cursor_png(&cursor, &CursorStyleConfig { size: 28.0, style: "arrow".into(), color: "#ffffff".into(), click_ripple: true, smooth_path: true, ripple_size: Some(70.0) }).unwrap();
         let result = Command::new(ffmpeg)
             .args(["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x180:r=10:d=15"])
             .args(["-loop", "1", "-i"]).arg(&cursor)

@@ -28,6 +28,7 @@ export interface CursorStyleConfig {
   color: string;
   clickRipple: boolean;
   smoothPath: boolean;
+  rippleSize: number;
 }
 
 export interface CropRect {
