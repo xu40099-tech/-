@@ -134,39 +134,6 @@ function normalizeMouseEvents(events: MouseEventRecord[], region?: Region) {
   }));
 }
 
-function isMousePositionEvent(event: MouseEventRecord) {
-  return event.action === "move" || event.action.endsWith("_down") || event.action === "double_click";
-}
-
-function findMouseAt(events: MouseEventRecord[], timeMs: number) {
-  let previous: MouseEventRecord | undefined;
-  let next: MouseEventRecord | undefined;
-
-  for (const event of events) {
-    if (!isMousePositionEvent(event)) continue;
-    if (event.timestamp <= timeMs) {
-      previous = event;
-      continue;
-    }
-    next = event;
-    break;
-  }
-
-  if (!previous) return next;
-  if (!next) return previous;
-
-  const span = Math.max(1, next.timestamp - previous.timestamp);
-  const progress = clamp((timeMs - previous.timestamp) / span, 0, 1);
-  const eased = smoothstep(progress);
-
-  return {
-    ...previous,
-    timestamp: timeMs,
-    x: previous.x + (next.x - previous.x) * eased,
-    y: previous.y + (next.y - previous.y) * eased,
-  };
-}
-
 function activeClickAt(events: MouseEventRecord[], timeMs: number) {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
@@ -215,8 +182,15 @@ function syncEditedPreview(video: HTMLVideoElement, segments: EditSegment[]) {
     video.playbackRate = segments[0].speed;
     return segments[0].sourceStart;
   }
-  video.pause();
-  return segments.at(-1)?.sourceEnd ?? sourceTimeMs;
+  const last = segments.at(-1);
+  if (last && last.sourceEnd < video.duration * 1000 - 50 && sourceTimeMs >= last.sourceEnd) {
+    video.pause();
+    if (Math.abs(video.currentTime * 1000 - last.sourceEnd) > 50) {
+      video.currentTime = last.sourceEnd / 1000;
+    }
+    return last.sourceEnd;
+  }
+  return sourceTimeMs;
 }
 
 function App() {
@@ -257,7 +231,6 @@ function App() {
   const previewZoomScale = zoomScaleAt(activeZoom, currentTime);
   const visibleSegments = useMemo(() => sortedSegments(editState, duration), [duration, editState]);
   const selectedSegment = visibleSegments.find((segment) => segment.id === selectedSegmentId) ?? visibleSegments[0];
-  const currentMouse = findMouseAt(mouseEvents, currentTime);
   const currentClick = activeClickAt(mouseEvents, currentTime);
   const clickProgress = currentClick
     ? smoothstep((currentTime - currentClick.timestamp) / CLICK_RIPPLE_MS)
@@ -349,7 +322,7 @@ function App() {
 
     try {
       const native = await invoke<NativeRecordingStartResult>("start_recording", {
-        config: recordingConfig,
+        config: { ...recordingConfig, cursorStyle },
       });
       startedAtRef.current = performance.now();
       updateRecordingConfig({ sourceType: "screen", sourceId: "current-display", captureBounds: native.captureBounds });
@@ -583,8 +556,6 @@ function App() {
   const previewCrop = crop ?? { x: 0, y: 0, width: captureWidth, height: captureHeight };
   const zoomOriginX = activeZoom ? clamp(((activeZoom.center.x - previewCrop.x) / previewCrop.width) * 100, 0, 100) : 50;
   const zoomOriginY = activeZoom ? clamp(((activeZoom.center.y - previewCrop.y) / previewCrop.height) * 100, 0, 100) : 50;
-  const cursorLeft = currentMouse ? clamp((currentMouse.x / captureWidth) * 100, 0, 100) : 50;
-  const cursorTop = currentMouse ? clamp((currentMouse.y / captureHeight) * 100, 0, 100) : 50;
   const clickLeft = currentClick ? clamp((currentClick.x / captureWidth) * 100, 0, 100) : 50;
   const clickTop = currentClick ? clamp((currentClick.y / captureHeight) * 100, 0, 100) : 50;
   const cropScaleX = captureWidth / Math.max(1, previewCrop.width);
@@ -782,22 +753,17 @@ function App() {
                       ref={videoRef}
                       src={recordingUrl}
                       controls
+                      onLoadedMetadata={(event) => {
+                        const mediaDuration = Math.max(1_000, event.currentTarget.duration * 1000);
+                        if (editState.segments.length <= 1) {
+                          setDuration(mediaDuration);
+                          resetEditing(mediaDuration);
+                        }
+                      }}
                       onPlay={(event) => setCurrentTime(syncEditedPreview(event.currentTarget, visibleSegments))}
                       onTimeUpdate={(event) => setCurrentTime(syncEditedPreview(event.currentTarget, visibleSegments))}
                       onSeeked={(event) => setCurrentTime(syncEditedPreview(event.currentTarget, visibleSegments))}
                     />
-                {currentMouse && (
-                  <div
-                    className={`custom-cursor ${cursorStyle.style}`}
-                    style={{
-                      left: `${cursorLeft}%`,
-                      top: `${cursorTop}%`,
-                      width: `${cursorStyle.size}px`,
-                      height: `${cursorStyle.size}px`,
-                      color: cursorStyle.color,
-                    }}
-                  />
-                )}
                 {currentClick && cursorStyle.clickRipple && (
                   <div
                     className="click-ripple"

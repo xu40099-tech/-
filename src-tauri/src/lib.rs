@@ -59,11 +59,13 @@ struct RecorderState {
 struct NativeRecordingSession {
     child: Child,
     path: PathBuf,
+    final_path: PathBuf,
     started_at: u128,
     mouse_stop: Arc<AtomicBool>,
     mouse_events: Arc<Mutex<Vec<MouseEventRecord>>>,
     mouse_thread: Option<JoinHandle<()>>,
     capture_bounds: MonitorCaptureConfig,
+    cursor_style: CursorStyleConfig,
 }
 
 #[derive(Serialize)]
@@ -579,10 +581,16 @@ fn start_recording(
     }
 
     let fps = config.get("fps").and_then(Value::as_u64).unwrap_or(60);
+    let cursor_style = config
+        .get("cursorStyle")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or(CursorStyleConfig { size: 28.0, style: "arrow".into(), color: "#ffffff".into(), click_ripple: true, smooth_path: true });
     let (monitor, output_idx) = current_main_monitor_config(&app)?;
     let ffmpeg = ffmpeg_path(&app)
         .ok_or_else(|| "安装包中缺少 FFmpeg。".to_string())?;
-    let output = recording_output_path("mp4")?;
+    let final_path = recording_output_path("mp4")?;
+    let output = final_path.with_file_name(format!(".screen-studio-raw-{}.mp4", now_millis()));
 
     let mut command = Command::new(ffmpeg);
     hide_subprocess_window(&mut command);
@@ -633,11 +641,13 @@ fn start_recording(
     *session = Some(NativeRecordingSession {
         child,
         path: output.clone(),
+        final_path,
         started_at,
         mouse_stop,
         mouse_events,
         mouse_thread,
         capture_bounds: monitor.clone(),
+        cursor_style,
     });
 
     Ok(NativeRecordingStartResult {
@@ -662,9 +672,57 @@ fn resume_recording() -> CommandMessage {
     }
 }
 
+fn bake_cursor_recording(
+    app: &tauri::AppHandle,
+    input: &PathBuf,
+    output: &PathBuf,
+    events: &[MouseEventRecord],
+    style: &CursorStyleConfig,
+) -> Result<(), String> {
+    let ffmpeg = ffmpeg_path(app).ok_or_else(|| "安装包中缺少 FFmpeg。".to_string())?;
+    let cursor_png = project_store_dir()?.join(format!("cursor-base-{}.png", now_millis()));
+    write_cursor_png(&cursor_png, style)?;
+    let overlay = build_cursor_overlay(events, Some(style), true)
+        .ok_or_else(|| "没有可用于生成大鼠标的轨迹。".to_string())?;
+    let graph = format!("[0:v]null[cursorbase];{overlay};[cursorout]null[vout]");
+    let script = project_store_dir()?.join(format!("cursor-base-filter-{}.txt", now_millis()));
+    fs::write(&script, graph).map_err(|error| error.to_string())?;
+
+    let mut command = Command::new(ffmpeg);
+    hide_subprocess_window(&mut command);
+    let result = command
+        .arg("-y").arg("-i").arg(input)
+        .args(["-loop", "1", "-i"]).arg(&cursor_png)
+        .arg("-filter_complex_script").arg(&script)
+        .args(["-map", "[vout]", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-an"])
+        .arg(output)
+        .output()
+        .map_err(|error| error.to_string());
+    let _ = fs::remove_file(&script);
+    let _ = fs::remove_file(&cursor_png);
+    let result = result?;
+    if !result.status.success() {
+        let _ = fs::remove_file(output);
+        return Err(String::from_utf8_lossy(&result.stderr).lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
+    }
+    let ffmpeg = ffmpeg_path(app).ok_or_else(|| "安装包中缺少 FFmpeg。".to_string())?;
+    let mut validation = Command::new(ffmpeg);
+    hide_subprocess_window(&mut validation);
+    let validation = validation
+        .args(["-hide_banner", "-v", "error", "-i"]).arg(output)
+        .args(["-map", "0:v:0", "-f", "null", "-"])
+        .output().map_err(|error| error.to_string())?;
+    if !validation.status.success() || fs::metadata(output).map(|value| value.len() == 0).unwrap_or(true) {
+        let _ = fs::remove_file(output);
+        return Err("带大鼠标的自动保存视频验证失败，已保留临时原始录像。".into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn stop_recording(
     state: tauri::State<RecorderState>,
+    app: tauri::AppHandle,
 ) -> Result<NativeRecordingStopResult, String> {
     let mut guard = state.session.lock().map_err(|error| error.to_string())?;
     let mut session = guard
@@ -699,8 +757,39 @@ fn stop_recording(
     if !recording_succeeded || !session.path.exists() {
         return Err("屏幕录制进程异常退出，未生成有效的录制文件。".to_string());
     }
+    let mut normalized_events = mouse_events
+        .iter()
+        .map(|event| {
+            let mut next = event.clone();
+            next.x -= session.capture_bounds.x;
+            next.y -= session.capture_bounds.y;
+            next
+        })
+        .collect::<Vec<_>>();
+    if normalized_events.is_empty() {
+        normalized_events.push(MouseEventRecord {
+            id: "mouse-static-center".into(),
+            timestamp: 0,
+            x: (session.capture_bounds.width / 2) as i32,
+            y: (session.capture_bounds.height / 2) as i32,
+            action: "move".into(),
+            click_count: None,
+            cursor_state: "default".into(),
+        });
+    }
+    if let Err(error) = bake_cursor_recording(&app, &session.path, &session.final_path, &normalized_events, &session.cursor_style) {
+        let _ = fs::remove_file(&session.final_path);
+        fs::rename(&session.path, &session.final_path).map_err(|rename_error| {
+            format!("生成大鼠标自动保存视频失败：{error}；恢复原始录像也失败：{rename_error}")
+        })?;
+        return Err(format!(
+            "生成大鼠标自动保存视频失败，原始录像已恢复到：{}。错误：{error}",
+            session.final_path.to_string_lossy()
+        ));
+    }
+    let _ = fs::remove_file(&session.path);
     Ok(NativeRecordingStopResult {
-        path: session.path.to_string_lossy().to_string(),
+        path: session.final_path.to_string_lossy().to_string(),
         duration,
         mime_type: "video/mp4".into(),
         mouse_events,
@@ -963,6 +1052,7 @@ fn build_linear_expr(samples: &[(f64, i32, i32)], axis: char) -> String {
 fn build_cursor_filters(
     events: &[MouseEventRecord],
     cursor_style: Option<&CursorStyleConfig>,
+    draw_cursor: bool,
 ) -> Vec<String> {
     let Some(style) = cursor_style else {
         return Vec::new();
@@ -1022,7 +1112,7 @@ fn build_cursor_filters(
             format!("gte(t,{enable_start:.3})*lt(t,{enable_end:.3})")
         };
 
-        if style.style == "ring" || style.style == "dot" {
+        if draw_cursor && (style.style == "ring" || style.style == "dot") {
             let bands = 9_u32;
             let band_height = (size as f64 / bands as f64).ceil() as u32;
             for band in 0..bands {
@@ -1047,7 +1137,7 @@ fn build_cursor_filters(
                     ));
                 }
             }
-        } else if style.style != "arrow" {
+        } else if draw_cursor && style.style != "arrow" {
             let step = (size / 4).max(2);
             cursor_filters.extend((0..4).map(|index| {
                 let offset = index * step;
@@ -1090,8 +1180,8 @@ fn build_cursor_filters(
     filters
 }
 
-fn build_arrow_overlay(events: &[MouseEventRecord], style: Option<&CursorStyleConfig>) -> Option<String> {
-    let style = style.filter(|style| style.style == "arrow")?;
+fn build_cursor_overlay(events: &[MouseEventRecord], style: Option<&CursorStyleConfig>, all_styles: bool) -> Option<String> {
+    let style = style.filter(|style| all_styles || style.style == "arrow")?;
     let positions = events
         .iter()
         .filter(|event| event.action == "move" || event.action.ends_with("_down") || event.action == "double_click")
@@ -1121,8 +1211,13 @@ fn build_arrow_overlay(events: &[MouseEventRecord], style: Option<&CursorStyleCo
         let start_index = chunk_index * SAMPLES_PER_OVERLAY;
         let end_index = ((chunk_index + 1) * SAMPLES_PER_OVERLAY).min(samples.len().saturating_sub(1));
         let chunk = &samples[start_index..=end_index];
-        let x = build_linear_expr(chunk, 'x');
-        let y = build_linear_expr(chunk, 'y');
+        let mut x = build_linear_expr(chunk, 'x');
+        let mut y = build_linear_expr(chunk, 'y');
+        if style.style != "arrow" {
+            let half = size as f64 / 2.0;
+            x = format!("({x})-{half:.1}");
+            y = format!("({y})-{half:.1}");
+        }
         let start = if chunk_index == 0 { 0.0 } else { chunk[0].0 };
         let end = if chunk_index + 1 == chunk_count { 86_400.0 } else { chunk.last().unwrap().0 };
         let enable = if chunk_index + 1 == chunk_count {
@@ -1208,6 +1303,7 @@ fn build_video_filter_graph(
     edit_state: Option<&VideoEditState>,
     source_width: f64,
     source_height: f64,
+    cursor_already_baked: bool,
 ) -> String {
     let segments = normalize_edit_segments(edit_state);
     let crop_rect = edit_state.and_then(|state| state.crop_rect.as_ref());
@@ -1240,9 +1336,9 @@ fn build_video_filter_graph(
         }
     };
 
-    let arrow_overlay = build_arrow_overlay(&mapped_mouse_events, cursor_style);
+    let arrow_overlay = if cursor_already_baked { None } else { build_cursor_overlay(&mapped_mouse_events, cursor_style, false) };
     let mut filters = Vec::new();
-    filters.extend(build_cursor_filters(&mapped_mouse_events, cursor_style));
+    filters.extend(build_cursor_filters(&mapped_mouse_events, cursor_style, !cursor_already_baked));
     if let Some(filter) = crop_filter(crop_rect, source_width, source_height) {
         filters.push(filter);
     }
@@ -1271,6 +1367,7 @@ fn run_export(
     source_height: f64,
     fps: u32,
     destination_path: Option<&str>,
+    cursor_already_baked: bool,
 ) -> Result<ExportResult, String> {
     let input = PathBuf::from(asset_path);
     if !input.exists() {
@@ -1315,14 +1412,18 @@ fn run_export(
     let mut command = Command::new(&ffmpeg);
     hide_subprocess_window(&mut command);
     command.arg("-y").arg("-i").arg(asset_path);
-    let cursor_png = cursor_style
-        .filter(|style| style.style == "arrow" && !mouse_events.is_empty())
-        .map(|style| {
-            let path = project_store_dir()?.join(format!("cursor-{}.png", now_millis()));
-            write_cursor_png(&path, style)?;
-            Ok::<PathBuf, String>(path)
-        })
-        .transpose()?;
+    let cursor_png = if cursor_already_baked {
+        None
+    } else {
+        cursor_style
+            .filter(|style| style.style == "arrow" && !mouse_events.is_empty())
+            .map(|style| {
+                let path = project_store_dir()?.join(format!("cursor-{}.png", now_millis()));
+                write_cursor_png(&path, style)?;
+                Ok::<PathBuf, String>(path)
+            })
+            .transpose()?
+    };
     if let Some(path) = cursor_png.as_ref() {
         command.args(["-loop", "1", "-i"]).arg(path);
     }
@@ -1336,6 +1437,7 @@ fn run_export(
         edit_state,
         source_width,
         source_height,
+        cursor_already_baked,
     );
     let filter_script = project_store_dir()?.join(format!("export-filter-{}.txt", chrono_like_stamp()));
     fs::write(&filter_script, &filter_graph).map_err(|error| error.to_string())?;
@@ -1456,6 +1558,7 @@ fn export_recording(
         source_height,
         fps,
         input.destination_path.as_deref(),
+        true,
     )
 }
 
@@ -1497,6 +1600,7 @@ fn export_project(
         1080.0,
         60,
         None,
+        true,
     )
 }
 
@@ -1559,6 +1663,7 @@ mod tests {
             Some(&edit_state),
             1280.0,
             720.0,
+            false,
         );
 
         assert!(graph.contains("trim=start=0.000:end=2.000"));
@@ -1568,6 +1673,14 @@ mod tests {
         assert!(graph.contains("crop=640:360:10:20"));
         assert!(graph.contains("zoompan"));
         assert!(graph.contains("[vout]"));
+
+        let baked_graph = build_video_filter_graph(
+            "1080p", 60, &[],
+            &[MouseEventRecord { id: "click".into(), timestamp: 240, x: 120, y: 160, action: "left_down".into(), click_count: Some(1), cursor_state: "default".into() }],
+            Some(&cursor_style), None, 1280.0, 720.0, true,
+        );
+        assert!(!baked_graph.contains("[1:v]"));
+        assert!(baked_graph.contains("between(t,0.240"));
     }
 
     #[test]
@@ -1605,6 +1718,7 @@ mod tests {
             None,
             320.0,
             180.0,
+            false,
         );
         let script = std::env::temp_dir().join(format!("screen-studio-filter-{}.txt", now_millis()));
         let cursor = std::env::temp_dir().join(format!("screen-studio-cursor-{}.png", now_millis()));
