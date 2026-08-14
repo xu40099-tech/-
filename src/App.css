@@ -424,7 +424,7 @@ button.selected {
 }
 
 .custom-cursor {
-  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.45));
+  filter: none;
 }
 
 .custom-cursor.arrow {

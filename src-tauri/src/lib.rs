@@ -376,6 +376,68 @@ fn hide_subprocess_window(command: &mut Command) {
     }
 }
 
+fn parse_hex_color(value: &str) -> [u8; 3] {
+    let value = value.trim().trim_start_matches('#');
+    if value.len() == 6 {
+        if let (Ok(r), Ok(g), Ok(b)) = (
+            u8::from_str_radix(&value[0..2], 16),
+            u8::from_str_radix(&value[2..4], 16),
+            u8::from_str_radix(&value[4..6], 16),
+        ) {
+            return [r, g, b];
+        }
+    }
+    [255, 255, 255]
+}
+
+fn point_in_polygon(x: f64, y: f64, points: &[(f64, f64)]) -> bool {
+    let mut inside = false;
+    let mut previous = points[points.len() - 1];
+    for &current in points {
+        if (current.1 > y) != (previous.1 > y)
+            && x < (previous.0 - current.0) * (y - current.1) / (previous.1 - current.1) + current.0
+        {
+            inside = !inside;
+        }
+        previous = current;
+    }
+    inside
+}
+
+fn write_cursor_png(path: &std::path::Path, style: &CursorStyleConfig) -> Result<(), String> {
+    let size = style.size.clamp(8.0, 96.0).round() as u32;
+    let [r, g, b] = parse_hex_color(&style.color);
+    let mut pixels = vec![0_u8; (size * size * 4) as usize];
+    for y in 0..size {
+        for x in 0..size {
+            let xf = x as f64 / size as f64;
+            let yf = y as f64 / size as f64;
+            let filled = match style.style.as_str() {
+                "dot" => ((xf - 0.5).powi(2) + (yf - 0.5).powi(2)).sqrt() <= 0.48,
+                "ring" => {
+                    let distance = ((xf - 0.5).powi(2) + (yf - 0.5).powi(2)).sqrt();
+                    (0.38..=0.48).contains(&distance)
+                }
+                _ => point_in_polygon(
+                    xf,
+                    yf,
+                    &[(0.0, 0.0), (0.0, 1.0), (0.34, 0.72), (0.52, 1.0), (0.70, 0.90), (0.52, 0.62), (0.92, 0.62)],
+                ),
+            };
+            if filled {
+                let index = ((y * size + x) * 4) as usize;
+                pixels[index..index + 4].copy_from_slice(&[r, g, b, 255]);
+            }
+        }
+    }
+    let file = fs::File::create(path).map_err(|error| error.to_string())?;
+    let mut encoder = png::Encoder::new(file, size, size);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|error| error.to_string())?;
+    writer.write_image_data(&pixels).map_err(|error| error.to_string())
+}
+
 #[cfg(windows)]
 fn spawn_mouse_recorder(
     started_at: u128,
@@ -985,7 +1047,7 @@ fn build_cursor_filters(
                     ));
                 }
             }
-        } else {
+        } else if style.style != "arrow" {
             let step = (size / 4).max(2);
             cursor_filters.extend((0..4).map(|index| {
                 let offset = index * step;
@@ -1026,6 +1088,53 @@ fn build_cursor_filters(
     }
 
     filters
+}
+
+fn build_arrow_overlay(events: &[MouseEventRecord], style: Option<&CursorStyleConfig>) -> Option<String> {
+    let style = style.filter(|style| style.style == "arrow")?;
+    let positions = events
+        .iter()
+        .filter(|event| event.action == "move" || event.action.ends_with("_down") || event.action == "double_click")
+        .collect::<Vec<_>>();
+    if positions.is_empty() {
+        return None;
+    }
+    let stride = (positions.len() / 900).max(1);
+    let mut samples = positions
+        .iter()
+        .step_by(stride)
+        .map(|event| (event.timestamp as f64 / 1000.0, event.x, event.y))
+        .collect::<Vec<_>>();
+    if let Some(last) = positions.last() {
+        let last_time = last.timestamp as f64 / 1000.0;
+        if samples.last().map(|sample| sample.0) != Some(last_time) {
+            samples.push((last_time, last.x, last.y));
+        }
+    }
+    let size = style.size.clamp(8.0, 96.0).round() as u32;
+    const SAMPLES_PER_OVERLAY: usize = 40;
+    let chunk_count = samples.len().saturating_sub(1).div_ceil(SAMPLES_PER_OVERLAY).max(1);
+    let cursor_labels = (0..chunk_count).map(|index| format!("[cursor{index}]")).collect::<String>();
+    let mut parts = vec![format!("[1:v]scale={size}:{size},split={chunk_count}{cursor_labels}")];
+    let mut base = "[cursorbase]".to_string();
+    for chunk_index in 0..chunk_count {
+        let start_index = chunk_index * SAMPLES_PER_OVERLAY;
+        let end_index = ((chunk_index + 1) * SAMPLES_PER_OVERLAY).min(samples.len().saturating_sub(1));
+        let chunk = &samples[start_index..=end_index];
+        let x = build_linear_expr(chunk, 'x');
+        let y = build_linear_expr(chunk, 'y');
+        let start = if chunk_index == 0 { 0.0 } else { chunk[0].0 };
+        let end = if chunk_index + 1 == chunk_count { 86_400.0 } else { chunk.last().unwrap().0 };
+        let enable = if chunk_index + 1 == chunk_count {
+            format!("between(t,{start:.3},{end:.3})")
+        } else {
+            format!("gte(t,{start:.3})*lt(t,{end:.3})")
+        };
+        let output = if chunk_index + 1 == chunk_count { "[cursorout]".into() } else { format!("[cursorbase{}]", chunk_index + 1) };
+        parts.push(format!("{base}[cursor{chunk_index}]overlay=x='{x}':y='{y}':enable='{enable}':shortest=1{output}"));
+        base = output;
+    }
+    Some(parts.join(";"))
 }
 
 fn crop_filter(crop_rect: Option<&CropRect>, source_width: f64, source_height: f64) -> Option<String> {
@@ -1131,13 +1240,20 @@ fn build_video_filter_graph(
         }
     };
 
+    let arrow_overlay = build_arrow_overlay(&mapped_mouse_events, cursor_style);
     let mut filters = Vec::new();
     filters.extend(build_cursor_filters(&mapped_mouse_events, cursor_style));
     if let Some(filter) = crop_filter(crop_rect, source_width, source_height) {
         filters.push(filter);
     }
     filters.push(build_zoom_filter(resolution, fps, &mapped_zoom_segments));
-    graph_parts.push(format!("{current_label}{}[vout]", filters.join(",")));
+    if let Some(overlay) = arrow_overlay {
+        graph_parts.push(format!("{current_label}null[cursorbase]"));
+        graph_parts.push(overlay);
+        graph_parts.push(format!("[cursorout]{}[vout]", filters.join(",")));
+    } else {
+        graph_parts.push(format!("{current_label}{}[vout]", filters.join(",")));
+    }
     graph_parts.join(";")
 }
 
@@ -1199,6 +1315,17 @@ fn run_export(
     let mut command = Command::new(&ffmpeg);
     hide_subprocess_window(&mut command);
     command.arg("-y").arg("-i").arg(asset_path);
+    let cursor_png = cursor_style
+        .filter(|style| style.style == "arrow" && !mouse_events.is_empty())
+        .map(|style| {
+            let path = project_store_dir()?.join(format!("cursor-{}.png", now_millis()));
+            write_cursor_png(&path, style)?;
+            Ok::<PathBuf, String>(path)
+        })
+        .transpose()?;
+    if let Some(path) = cursor_png.as_ref() {
+        command.args(["-loop", "1", "-i"]).arg(path);
+    }
     let export_fps = if format == "gif" { 15 } else { fps };
     let filter_graph = build_video_filter_graph(
         if format == "gif" { "1080p" } else { resolution },
@@ -1230,10 +1357,12 @@ fn run_export(
         Err(error) => {
             let _ = fs::remove_file(&filter_script);
             let _ = fs::remove_file(&temporary_output);
+            if let Some(path) = cursor_png.as_ref() { let _ = fs::remove_file(path); }
             return Err(error.to_string());
         }
     };
     let _ = fs::remove_file(&filter_script);
+    if let Some(path) = cursor_png.as_ref() { let _ = fs::remove_file(path); }
     if !output_result.status.success() {
         let _ = fs::remove_file(&temporary_output);
         let stderr = String::from_utf8_lossy(&output_result.stderr);
@@ -1253,7 +1382,9 @@ fn run_export(
         });
     }
 
-    let validation = Command::new(&ffmpeg)
+    let mut validation_command = Command::new(&ffmpeg);
+    hide_subprocess_window(&mut validation_command);
+    let validation = validation_command
         .args(["-hide_banner", "-v", "error", "-i"])
         .arg(&temporary_output)
         .args(["-map", "0:v:0", "-f", "null", "-"])
@@ -1476,13 +1607,17 @@ mod tests {
             180.0,
         );
         let script = std::env::temp_dir().join(format!("screen-studio-filter-{}.txt", now_millis()));
+        let cursor = std::env::temp_dir().join(format!("screen-studio-cursor-{}.png", now_millis()));
         fs::write(&script, graph).unwrap();
+        write_cursor_png(&cursor, &CursorStyleConfig { size: 28.0, style: "arrow".into(), color: "#ffffff".into(), click_ripple: true, smooth_path: true }).unwrap();
         let result = Command::new(ffmpeg)
             .args(["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x180:r=10:d=15"])
+            .args(["-loop", "1", "-i"]).arg(&cursor)
             .arg("-filter_complex_script").arg(&script)
             .args(["-map", "[vout]", "-f", "null", "-"])
             .output().unwrap();
         let _ = fs::remove_file(script);
+        let _ = fs::remove_file(cursor);
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     }
 
