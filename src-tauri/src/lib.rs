@@ -1193,7 +1193,14 @@ fn build_cursor_overlay(events: &[MouseEventRecord], style: Option<&CursorStyleC
     let stride = (positions.len() / 900).max(1);
     let mut samples = positions
         .iter()
-        .step_by(stride)
+        .enumerate()
+        .filter(|(index, event)| {
+            index % stride == 0
+                || event.action == "left_down"
+                || event.action == "double_click"
+                || event.action == "right_down"
+        })
+        .map(|(_, event)| event)
         .map(|event| (event.timestamp as f64 / 1000.0, event.x, event.y))
         .collect::<Vec<_>>();
     if let Some(last) = positions.last() {
@@ -1736,6 +1743,43 @@ mod tests {
         let _ = fs::remove_file(script);
         let _ = fs::remove_file(cursor);
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    }
+
+    #[test]
+    fn cursor_overlay_keeps_exact_click_samples_when_motion_is_downsampled() {
+        let mut events = (0..1_802)
+            .map(|index| MouseEventRecord {
+                id: format!("move-{index}"),
+                timestamp: index * 16,
+                x: index as i32,
+                y: 100,
+                action: "move".into(),
+                click_count: None,
+                cursor_state: "default".into(),
+            })
+            .collect::<Vec<_>>();
+        events[901] = MouseEventRecord {
+            id: "exact-click".into(),
+            timestamp: 901 * 16,
+            x: 777,
+            y: 333,
+            action: "left_down".into(),
+            click_count: Some(1),
+            cursor_state: "default".into(),
+        };
+        let style = CursorStyleConfig {
+            size: 28.0,
+            style: "arrow".into(),
+            color: "#ffffff".into(),
+            click_ripple: true,
+            smooth_path: true,
+            ripple_size: Some(70.0),
+        };
+
+        let graph = build_cursor_overlay(&events, Some(&style), true).unwrap();
+
+        assert!(graph.contains("777.000"));
+        assert!(graph.contains("333.000"));
     }
 
     #[test]
