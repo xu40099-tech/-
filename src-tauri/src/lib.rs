@@ -56,6 +56,11 @@ struct RecorderState {
     session: Mutex<Option<NativeRecordingSession>>,
 }
 
+#[derive(Default)]
+struct PreviewAssetState {
+    operation: Mutex<()>,
+}
+
 struct NativeRecordingSession {
     child: Child,
     path: PathBuf,
@@ -81,6 +86,8 @@ struct NativeRecordingStartResult {
 #[derive(Serialize)]
 struct NativeRecordingStopResult {
     path: String,
+    #[serde(rename = "sourcePath")]
+    source_path: String,
     duration: u128,
     #[serde(rename = "mimeType")]
     mime_type: String,
@@ -136,6 +143,31 @@ struct DirectExportInput {
     #[serde(rename = "editState")]
     edit_state: Option<VideoEditState>,
     fps: Option<u32>,
+    #[serde(rename = "cursorAlreadyBaked", default)]
+    cursor_already_baked: bool,
+}
+
+#[derive(Deserialize)]
+struct RerenderPreviewInput {
+    #[serde(rename = "sourcePath")]
+    source_path: String,
+    #[serde(rename = "previewPath")]
+    preview_path: String,
+    #[serde(rename = "mouseEvents", default)]
+    mouse_events: Vec<MouseEventRecord>,
+    #[serde(rename = "cursorStyle")]
+    cursor_style: CursorStyleConfig,
+    #[serde(rename = "sourceWidth")]
+    source_width: f64,
+    #[serde(rename = "sourceHeight")]
+    source_height: f64,
+}
+
+#[derive(Serialize)]
+struct PreviewRenderResult {
+    path: String,
+    #[serde(rename = "mimeType")]
+    mime_type: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -684,9 +716,7 @@ fn bake_cursor_recording(
     let ffmpeg = ffmpeg_path(app).ok_or_else(|| "安装包中缺少 FFmpeg。".to_string())?;
     let cursor_png = project_store_dir()?.join(format!("cursor-base-{}.png", now_millis()));
     write_cursor_png(&cursor_png, style)?;
-    let overlay = build_cursor_overlay(events, Some(style), true)
-        .ok_or_else(|| "没有可用于生成大鼠标的轨迹。".to_string())?;
-    let graph = format!("[0:v]null[cursorbase];{overlay};[cursorout]null[vout]");
+    let graph = build_baked_preview_graph(events, style)?;
     let script = project_store_dir()?.join(format!("cursor-base-filter-{}.txt", now_millis()));
     fs::write(&script, graph).map_err(|error| error.to_string())?;
 
@@ -719,6 +749,86 @@ fn bake_cursor_recording(
         return Err("带大鼠标的自动保存视频验证失败，已保留临时原始录像。".into());
     }
     Ok(())
+}
+
+fn build_baked_preview_graph(
+    events: &[MouseEventRecord],
+    style: &CursorStyleConfig,
+) -> Result<String, String> {
+    let overlay = build_cursor_overlay(events, Some(style), true)
+        .ok_or_else(|| "没有可用于生成大鼠标的轨迹。".to_string())?;
+    Ok(format!(
+        "[0:v]null[cursorbase];{overlay};[cursorout]null[vout]"
+    ))
+}
+
+fn replace_preview_file(temporary: &std::path::Path, destination: &std::path::Path) -> Result<(), String> {
+    let backup = destination.with_file_name(format!(".screen-studio-preview-backup-{}.mp4", now_millis()));
+    if destination.exists() {
+        fs::rename(destination, &backup).map_err(|error| format!("无法准备更新预览视频：{error}"))?;
+    }
+    if let Err(error) = fs::rename(temporary, destination) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, destination);
+        }
+        let _ = fs::remove_file(temporary);
+        return Err(format!("无法更新预览视频：{error}"));
+    }
+    let _ = fs::remove_file(backup);
+    Ok(())
+}
+
+fn copy_clean_source_to_preview(source: &std::path::Path, preview: &std::path::Path) -> Result<(), String> {
+    let temporary = preview.with_file_name(format!(".screen-studio-fallback-{}.mp4", now_millis()));
+    let _ = fs::remove_file(&temporary);
+    let copied = fs::copy(source, &temporary)
+        .map_err(|error| format!("无法从内部原始录屏创建临时预览副本：{error}"))?;
+    let source_size = fs::metadata(source).map_err(|error| error.to_string())?.len();
+    if copied != source_size || source_size == 0 {
+        let _ = fs::remove_file(&temporary);
+        return Err("内部原始录屏的预览副本不完整。".into());
+    }
+    replace_preview_file(&temporary, preview)
+}
+
+#[tauri::command]
+fn rerender_recording_preview(
+    input: RerenderPreviewInput,
+    app: tauri::AppHandle,
+    state: tauri::State<PreviewAssetState>,
+) -> Result<PreviewRenderResult, String> {
+    let _operation = state.operation.lock().map_err(|error| error.to_string())?;
+    let source = PathBuf::from(&input.source_path);
+    let preview = PathBuf::from(&input.preview_path);
+    if !source.exists() {
+        return Err(format!("找不到内部原始录屏：{}", input.source_path));
+    }
+    if fs::canonicalize(&source).ok() == fs::canonicalize(&preview).ok() && preview.exists() {
+        return Err("内部原始录屏与预览视频不能是同一个文件。".into());
+    }
+
+    let mut events = input.mouse_events;
+    if events.is_empty() {
+        events.push(MouseEventRecord {
+            id: "mouse-static-center".into(),
+            timestamp: 0,
+            x: (input.source_width / 2.0).round() as i32,
+            y: (input.source_height / 2.0).round() as i32,
+            action: "move".into(),
+            click_count: None,
+            cursor_state: "default".into(),
+        });
+    }
+
+    let temporary = preview.with_file_name(format!(".screen-studio-preview-{}.mp4", now_millis()));
+    let _ = fs::remove_file(&temporary);
+    bake_cursor_recording(&app, &source, &temporary, &events, &input.cursor_style)?;
+    replace_preview_file(&temporary, &preview)?;
+
+    Ok(PreviewRenderResult {
+        path: preview.to_string_lossy().to_string(),
+        mime_type: "video/mp4".into(),
+    })
 }
 
 #[tauri::command]
@@ -779,23 +889,25 @@ fn stop_recording(
             cursor_state: "default".into(),
         });
     }
-    if let Err(error) = bake_cursor_recording(&app, &session.path, &session.final_path, &normalized_events, &session.cursor_style) {
+    let preview_message = if let Err(error) = bake_cursor_recording(&app, &session.path, &session.final_path, &normalized_events, &session.cursor_style) {
         let _ = fs::remove_file(&session.final_path);
-        fs::rename(&session.path, &session.final_path).map_err(|rename_error| {
-            format!("生成大鼠标自动保存视频失败：{error}；恢复原始录像也失败：{rename_error}")
+        copy_clean_source_to_preview(&session.path, &session.final_path).map_err(|copy_error| {
+            format!(
+                "生成大鼠标自动保存视频失败：{error}；{copy_error}。内部原始录屏仍保留在：{}",
+                session.path.to_string_lossy()
+            )
         })?;
-        return Err(format!(
-            "生成大鼠标自动保存视频失败，原始录像已恢复到：{}。错误：{error}",
-            session.final_path.to_string_lossy()
-        ));
-    }
-    let _ = fs::remove_file(&session.path);
+        format!("大鼠标预览生成失败，已保留内部原始录屏并创建无特效预览。错误：{error}")
+    } else {
+        "Windows 屏幕录制已停止。".into()
+    };
     Ok(NativeRecordingStopResult {
         path: session.final_path.to_string_lossy().to_string(),
+        source_path: session.path.to_string_lossy().to_string(),
         duration,
         mime_type: "video/mp4".into(),
         mouse_events,
-        message: "Windows 屏幕录制已停止。".into(),
+        message: preview_message,
         capture_bounds: session.capture_bounds,
     })
 }
@@ -835,7 +947,11 @@ fn save_recording_asset(input: RecordingAssetInput) -> Result<AssetSaveResult, S
 }
 
 #[tauri::command]
-fn rename_recording(input: RenameRecordingInput) -> Result<SaveResult, String> {
+fn rename_recording(
+    input: RenameRecordingInput,
+    state: tauri::State<PreviewAssetState>,
+) -> Result<SaveResult, String> {
+    let _operation = state.operation.lock().map_err(|error| error.to_string())?;
     let current_path = PathBuf::from(&input.path);
     if !current_path.exists() {
         return Err(format!("找不到录制文件：{}", input.path));
@@ -1344,14 +1460,18 @@ fn build_video_filter_graph(
         }
     };
 
-    let arrow_overlay = if cursor_already_baked { None } else { build_cursor_overlay(&mapped_mouse_events, cursor_style, false) };
+    let cursor_overlay = if cursor_already_baked {
+        None
+    } else {
+        build_cursor_overlay(&mapped_mouse_events, cursor_style, true)
+    };
     let mut filters = Vec::new();
-    filters.extend(build_cursor_filters(&mapped_mouse_events, cursor_style, !cursor_already_baked));
+    filters.extend(build_cursor_filters(&mapped_mouse_events, cursor_style, false));
     if let Some(filter) = crop_filter(crop_rect, source_width, source_height) {
         filters.push(filter);
     }
     filters.push(build_zoom_filter(resolution, fps, &mapped_zoom_segments));
-    if let Some(overlay) = arrow_overlay {
+    if let Some(overlay) = cursor_overlay {
         graph_parts.push(format!("{current_label}null[cursorbase]"));
         graph_parts.push(overlay);
         graph_parts.push(format!("[cursorout]{}[vout]", filters.join(",")));
@@ -1424,7 +1544,7 @@ fn run_export(
         None
     } else {
         cursor_style
-            .filter(|style| style.style == "arrow" && !mouse_events.is_empty())
+            .filter(|_| !mouse_events.is_empty())
             .map(|style| {
                 let path = project_store_dir()?.join(format!("cursor-{}.png", now_millis()));
                 write_cursor_png(&path, style)?;
@@ -1566,7 +1686,7 @@ fn export_recording(
         source_height,
         fps,
         input.destination_path.as_deref(),
-        true,
+        input.cursor_already_baked,
     )
 }
 
@@ -1615,6 +1735,71 @@ fn export_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_result_exposes_clean_source_for_future_rerenders() {
+        let result = NativeRecordingStopResult {
+            path: r"C:\recordings\preview.mp4".into(),
+            source_path: r"C:\recordings\.source.mp4".into(),
+            duration: 1_000,
+            mime_type: "video/mp4".into(),
+            mouse_events: Vec::new(),
+            message: "ok".into(),
+            capture_bounds: MonitorCaptureConfig {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                scale_factor: 1.0,
+            },
+        };
+
+        let value = serde_json::to_value(result).unwrap();
+
+        assert_eq!(value["sourcePath"], r"C:\recordings\.source.mp4");
+    }
+
+    #[test]
+    fn rerendered_preview_bakes_only_the_large_cursor() {
+        let style = CursorStyleConfig {
+            size: 52.0,
+            style: "arrow".into(),
+            color: "#845ef7".into(),
+            click_ripple: true,
+            smooth_path: true,
+            ripple_size: Some(120.0),
+        };
+        let events = vec![MouseEventRecord {
+            id: "click".into(),
+            timestamp: 100,
+            x: 320,
+            y: 180,
+            action: "left_down".into(),
+            click_count: Some(1),
+            cursor_state: "default".into(),
+        }];
+
+        let graph = build_baked_preview_graph(&events, &style).unwrap();
+
+        assert!(graph.contains("[1:v]scale=52:52"));
+        assert!(!graph.contains("drawtext"));
+        assert!(!graph.contains("zoompan"));
+    }
+
+    #[test]
+    fn preview_fallback_copies_without_consuming_the_clean_source() {
+        let base = std::env::temp_dir().join(format!("screen-studio-fallback-{}", now_millis()));
+        fs::create_dir_all(&base).unwrap();
+        let source = base.join("source.mp4");
+        let preview = base.join("preview.mp4");
+        fs::write(&source, b"clean-source").unwrap();
+
+        copy_clean_source_to_preview(&source, &preview).unwrap();
+
+        assert_eq!(fs::read(&source).unwrap(), b"clean-source");
+        assert_eq!(fs::read(&preview).unwrap(), b"clean-source");
+        let _ = fs::remove_dir_all(base);
+    }
 
     #[test]
     fn file_stem_preserves_chinese_and_replaces_windows_forbidden_characters() {
@@ -1676,7 +1861,8 @@ mod tests {
         );
 
         assert!(graph.contains("trim=start=0.000:end=2.000"));
-        assert!(graph.contains("drawbox"));
+        assert!(graph.contains("[1:v]scale=28:28"));
+        assert!(!graph.contains("drawbox"));
         assert!(graph.contains("0.640"));
         assert!(graph.contains("drawtext=fontfile='C\\:/Windows/Fonts/seguisym.ttf':text='○'"));
         assert!(!graph.contains("w=70:h=70"));
@@ -1823,6 +2009,7 @@ mod tests {
 pub fn run() {
     tauri::Builder::default()
         .manage(RecorderState::default())
+        .manage(PreviewAssetState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -1832,6 +2019,7 @@ pub fn run() {
             pause_recording,
             resume_recording,
             stop_recording,
+            rerender_recording_preview,
             save_recording_asset,
             rename_recording,
             read_recording_asset,

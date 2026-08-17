@@ -152,6 +152,7 @@ export interface NativeRecordingStartResult {
 
 export interface NativeRecordingStopResult {
   path: string;
+  sourcePath: string;
   duration: number;
   mimeType: string;
   mouseEvents: MouseEventRecord[];

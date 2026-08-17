@@ -117,6 +117,15 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
+function bakedCursorSignature(style: CursorStyleConfig) {
+  return JSON.stringify({
+    size: style.size,
+    style: style.style,
+    color: style.color,
+    smoothPath: style.smoothPath,
+  });
+}
+
 function createFullSegment(durationMs: number): EditSegment {
   return {
     id: `segment-${Date.now()}`,
@@ -207,6 +216,7 @@ function App() {
   const [recordingState, setRecordingState] = useState<"idle" | "recording" | "ready">("idle");
   const [recordingUrl, setRecordingUrl] = useState<string>();
   const [recordingNativePath, setRecordingNativePath] = useState<string>();
+  const [recordingSourcePath, setRecordingSourcePath] = useState<string>();
   const [recordingName, setRecordingName] = useState("");
   const [recordingsDir, setRecordingsDir] = useState<string>();
   const [exportFileName, setExportFileName] = useState("");
@@ -214,6 +224,7 @@ function App() {
   const [exportPath, setExportPath] = useState<string>();
   const [isExporting, setIsExporting] = useState(false);
   const [isRenaming, setIsRenaming] = useState(false);
+  const [isRenderingPreview, setIsRenderingPreview] = useState(false);
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [mouseEvents, setMouseEvents] = useState<MouseEventRecord[]>([]);
@@ -224,6 +235,9 @@ function App() {
 
   const startedAtRef = useRef(0);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const renderedCursorSignatureRef = useRef("");
+  const previewRenderGenerationRef = useRef(0);
+  const pendingPreviewPlaybackRef = useRef<{ time: number; playing: boolean } | undefined>(undefined);
 
   const selectedSource = sources.find((source) => source.id === recordingConfig.sourceId) ?? sources[0];
   const captureWidth = recordingConfig.captureBounds?.width ?? selectedSource?.width ?? 1920;
@@ -273,6 +287,62 @@ function App() {
   }, [recordingState, recordingUrl, visibleSegments]);
 
   useEffect(() => {
+    if (recordingState !== "ready" || !recordingSourcePath || !recordingNativePath) return;
+    const signature = bakedCursorSignature(cursorStyle);
+    if (signature === renderedCursorSignatureRef.current) return;
+
+    const generation = previewRenderGenerationRef.current + 1;
+    previewRenderGenerationRef.current = generation;
+    const timer = window.setTimeout(async () => {
+      setIsRenderingPreview(true);
+      setStatus("正在按当前鼠标设置更新预览……");
+      try {
+        const currentVideo = videoRef.current;
+        pendingPreviewPlaybackRef.current = currentVideo
+          ? { time: currentVideo.currentTime, playing: !currentVideo.paused && !currentVideo.ended }
+          : undefined;
+        const result = await invoke<{ path: string; mimeType: string }>("rerender_recording_preview", {
+          input: {
+            sourcePath: recordingSourcePath,
+            previewPath: recordingNativePath,
+            mouseEvents,
+            cursorStyle,
+            sourceWidth: captureWidth,
+            sourceHeight: captureHeight,
+          },
+        });
+        if (previewRenderGenerationRef.current !== generation) return;
+        const previewUrl = await loadRecordingPreview(result.path, result.mimeType);
+        setRecordingUrl((current) => {
+          if (current) URL.revokeObjectURL(current);
+          return previewUrl;
+        });
+        renderedCursorSignatureRef.current = signature;
+        setStatus("预览已按当前鼠标大小、样式和颜色更新。");
+      } catch (error) {
+        if (previewRenderGenerationRef.current === generation) {
+          setStatus(`更新预览失败：${error instanceof Error ? error.message : String(error)}`);
+        }
+      } finally {
+        if (previewRenderGenerationRef.current === generation) setIsRenderingPreview(false);
+      }
+    }, 400);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    captureHeight,
+    captureWidth,
+    cursorStyle.color,
+    cursorStyle.size,
+    cursorStyle.smoothPath,
+    cursorStyle.style,
+    mouseEvents,
+    recordingNativePath,
+    recordingSourcePath,
+    recordingState,
+  ]);
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const combo = keyCombo(event);
       if (combo === recordingConfig.hotkeys.start.toUpperCase()) {
@@ -307,10 +377,12 @@ function App() {
   }
 
   async function startRecording() {
-    if (recordingState === "recording") return;
+    if (recordingState === "recording" || isRenderingPreview) return;
 
+    previewRenderGenerationRef.current += 1;
     setStatus("正在开始录制……");
     setRecordingUrl(undefined);
+    setRecordingSourcePath(undefined);
     setRecordingName("");
     setExportFileName("");
     setExportDestinationPath(undefined);
@@ -351,6 +423,8 @@ function App() {
       const fullSegment = createFullSegment(nextDuration);
       setRecordingUrl(previewUrl);
       setRecordingNativePath(result.path);
+      setRecordingSourcePath(result.sourcePath);
+      renderedCursorSignatureRef.current = bakedCursorSignature(cursorStyle);
       setRecordingName(fileStemFromPath(result.path));
       setExportFileName(`${fileStemFromPath(result.path)}-export`);
       setDuration(nextDuration);
@@ -391,7 +465,7 @@ function App() {
     try {
       const result = await invoke<ExportProjectResult>("export_recording", {
         input: {
-          sourcePath: recordingNativePath,
+          sourcePath: recordingSourcePath ?? recordingNativePath,
           format: exportConfig.format,
           resolution: exportConfig.resolution,
           destinationPath,
@@ -401,6 +475,7 @@ function App() {
           fps: recordingConfig.fps,
           mouseEvents,
           cursorStyle,
+          cursorAlreadyBaked: !recordingSourcePath,
           editState: {
             ...editState,
             segments: visibleSegments,
@@ -417,7 +492,7 @@ function App() {
   }
 
   async function renameRecording() {
-    if (isRenaming || !recordingNativePath) return;
+    if (isRenaming || isRenderingPreview || !recordingNativePath) return;
 
     const nextName = recordingName.trim();
     if (!nextName) {
@@ -651,6 +726,7 @@ function App() {
                 max="80"
                 step="2"
                 value={cursorStyle.size}
+                disabled={isRenderingPreview}
                 onChange={(event) => setCursorStyle((current) => ({ ...current, size: Number(event.target.value) }))}
               />
             </label>
@@ -658,6 +734,7 @@ function App() {
               样式
               <select
                 value={cursorStyle.style}
+                disabled={isRenderingPreview}
                 onChange={(event) =>
                   setCursorStyle((current) => ({ ...current, style: event.target.value as CursorStyleConfig["style"] }))
                 }
@@ -672,6 +749,7 @@ function App() {
               <input
                 type="color"
                 value={cursorStyle.color}
+                disabled={isRenderingPreview}
                 onChange={(event) => setCursorStyle((current) => ({ ...current, color: event.target.value }))}
               />
             </label>
@@ -711,7 +789,7 @@ function App() {
                 停止录制
               </button>
             ) : (
-              <button className="start-button" onClick={startRecording}>
+              <button className="start-button" onClick={startRecording} disabled={isRenderingPreview}>
                 <Circle size={18} fill="currentColor" />
                 开始录制
               </button>
@@ -746,7 +824,7 @@ function App() {
               <div
                 className="zoom-stage"
                 style={{
-                  aspectRatio: `${captureWidth} / ${captureHeight}`,
+                  aspectRatio: `${previewCrop.width} / ${previewCrop.height}`,
                   transform: `scale(${previewZoomScale})`,
                   transformOrigin: `${zoomOriginX}% ${zoomOriginY}%`,
                 }}
@@ -767,9 +845,18 @@ function App() {
                       controls
                       onLoadedMetadata={(event) => {
                         const mediaDuration = Math.max(1_000, event.currentTarget.duration * 1000);
-                        if (editState.segments.length <= 1) {
+                        if (duration <= 0 && editState.segments.length <= 1) {
                           setDuration(mediaDuration);
                           resetEditing(mediaDuration);
+                        }
+                        const pendingPlayback = pendingPreviewPlaybackRef.current;
+                        if (pendingPlayback) {
+                          event.currentTarget.currentTime = Math.min(
+                            pendingPlayback.time,
+                            Math.max(0, event.currentTarget.duration - 0.05),
+                          );
+                          if (pendingPlayback.playing) void event.currentTarget.play();
+                          pendingPreviewPlaybackRef.current = undefined;
                         }
                       }}
                       onPlay={(event) => setCurrentTime(syncEditedPreview(event.currentTarget, visibleSegments))}
@@ -998,7 +1085,7 @@ function App() {
             <input
               value={recordingName}
               placeholder="为本次录制命名"
-              disabled={!recordingNativePath || recordingState === "recording" || isRenaming}
+              disabled={!recordingNativePath || recordingState === "recording" || isRenaming || isRenderingPreview}
               onChange={(event) => setRecordingName(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Enter") void renameRecording();
@@ -1007,7 +1094,7 @@ function App() {
             <button
               className="rename-button"
               onClick={renameRecording}
-              disabled={!recordingNativePath || recordingState !== "ready" || isRenaming}
+              disabled={!recordingNativePath || recordingState !== "ready" || isRenaming || isRenderingPreview}
             >
               <Save size={16} />
               {isRenaming ? "正在保存名称" : "保存名称"}
