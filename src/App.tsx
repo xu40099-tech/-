@@ -784,12 +784,11 @@ function App() {
                       top: `${clickTop}%`,
                       width: `${cursorStyle.rippleSize}px`,
                       height: `${cursorStyle.rippleSize}px`,
-                      fontSize: `${cursorStyle.rippleSize}px`,
-                      color: cursorStyle.color,
+                      borderColor: cursorStyle.color,
                       opacity: 0.8 * (1 - clickProgress),
                       transform: `translate(-50%, -50%) scale(${0.25 + clickProgress * 0.75})`,
                     }}
-                  >○</div>
+                  />
                 )}
                   </div>
                 </div>
