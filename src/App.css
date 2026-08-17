@@ -319,11 +319,11 @@ button.selected {
 
 .video-frame {
   align-items: center;
-  background: #101820;
+  background: transparent;
   border-radius: 10px;
   display: flex;
   justify-content: center;
-  min-height: 520px;
+  min-height: 0;
   overflow: hidden;
   position: relative;
 }
@@ -337,12 +337,11 @@ button.selected {
 }
 
 .zoom-stage {
-  height: min(520px, 100%);
+  height: auto;
   max-height: 100%;
   max-width: 100%;
   position: relative;
   transition: none;
-  width: auto;
 }
 
 .preview-crop-viewport {

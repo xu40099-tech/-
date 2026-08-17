@@ -656,6 +656,7 @@ function App() {
   const clickTop = currentClick ? clamp((currentClick.y / captureHeight) * 100, 0, 100) : 50;
   const cropScaleX = captureWidth / Math.max(1, previewCrop.width);
   const cropScaleY = captureHeight / Math.max(1, previewCrop.height);
+  const previewAspect = previewCrop.width / Math.max(1, previewCrop.height);
 
   return (
     <main className="record-shell">
@@ -845,6 +846,7 @@ function App() {
                 className="zoom-stage"
                 style={{
                   aspectRatio: `${previewCrop.width} / ${previewCrop.height}`,
+                  width: `min(100%, ${520 * previewAspect}px)`,
                   transform: `scale(${previewZoomScale})`,
                   transformOrigin: `${zoomOriginX}% ${zoomOriginY}%`,
                 }}
