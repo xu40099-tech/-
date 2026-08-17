@@ -203,6 +203,26 @@ function syncEditedPreview(video: HTMLVideoElement, segments: EditSegment[]) {
   return sourceTimeMs;
 }
 
+function startOrSyncEditedPreview(video: HTMLVideoElement, segments: EditSegment[]) {
+  const first = segments[0];
+  const last = segments.at(-1);
+  const sourceTimeMs = video.currentTime * 1000;
+  if (first && last && (video.ended || sourceTimeMs >= last.sourceEnd - 20)) {
+    video.currentTime = first.sourceStart / 1000;
+    video.playbackRate = first.speed;
+    return first.sourceStart;
+  }
+  return syncEditedPreview(video, segments);
+}
+
+function resetEndedPreview(video: HTMLVideoElement, segments: EditSegment[]) {
+  const first = segments[0];
+  if (!first) return 0;
+  video.currentTime = first.sourceStart / 1000;
+  video.playbackRate = first.speed;
+  return first.sourceStart;
+}
+
 function App() {
   const [sources, setSources] = useState<CaptureSource[]>(fallbackSources);
   const [recordingConfig, setRecordingConfig] = useState(defaultRecordingConfig);
@@ -859,9 +879,10 @@ function App() {
                           pendingPreviewPlaybackRef.current = undefined;
                         }
                       }}
-                      onPlay={(event) => setCurrentTime(syncEditedPreview(event.currentTarget, visibleSegments))}
+                      onPlay={(event) => setCurrentTime(startOrSyncEditedPreview(event.currentTarget, visibleSegments))}
                       onTimeUpdate={(event) => setCurrentTime(syncEditedPreview(event.currentTarget, visibleSegments))}
                       onSeeked={(event) => setCurrentTime(syncEditedPreview(event.currentTarget, visibleSegments))}
+                      onEnded={(event) => setCurrentTime(resetEndedPreview(event.currentTarget, visibleSegments))}
                     />
                 {currentClick && cursorStyle.clickRipple && (
                   <div
